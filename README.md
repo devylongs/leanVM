@@ -18,7 +18,7 @@
   </tr>
   <tr>
     <td><a href="#sphincs-aggregation">leanSPHINCS aggregation</a></td>
-    <td align="right"><b>295/s</b></td>
+    <td align="right"><b>770/s</b></td>
   </tr>
   <tr>
     <td><a href="#data-availability">leanDA commitment</a></td>
@@ -69,7 +69,7 @@ Expect leanVM to change significantly:
 
 ### XMSS aggregation
 
-The XMSS parameters are specified in [XMSS.pdf](https://github.com/leanEthereum/leanVM/releases/download/doc-latest/XMSS.pdf), with a [(ROM) security proof in Lean 4](https://github.com/leanEthereum/leanMultisig/blob/main/formal/xmss/XmssSecurity/Statement.lean).
+The XMSS parameters are specified in [XMSS.pdf](https://github.com/leanEthereum/leanVM/releases/download/doc-latest/XMSS.pdf), with a [(ROM) security proof in Lean 4](https://github.com/leanEthereum/leanMultisig/blob/main/formal/xmss/XmssSecurity/Statement.lean). **This is not the definitive parameter set.**
 
 ```bash
 cargo leanvm aggregate --xmss 900 --log-inv-rate 1 --repeat 3
@@ -82,25 +82,25 @@ aggregation, 900 XMSS signatures
   proof size                  : 317.4 KiB
   proving time                : 0.545 s ± 1.5%      peak memory 7.385 GiB
   per signature               : 1,651.687 signatures/s
-  verifying                   : 5.258 ms
+  verifying                   : 3.977 ms
 ```
 
 ### SPHINCS aggregation
 
-The SPHINCS parameters are specified in [SPHINCS.pdf](https://github.com/leanEthereum/leanVM/releases/download/doc-latest/SPHINCS.pdf), with a [(ROM) security proof in Lean 4](https://github.com/leanEthereum/leanMultisig/blob/main/formal/sphincs/SphincsSecurity/Statement.lean).
+The SPHINCS parameters are specified in [SPHINCS.pdf](https://github.com/leanEthereum/leanVM/releases/download/doc-latest/SPHINCS.pdf), with a [(ROM) security proof in Lean 4](formal/sphincs/README.md). **This is not the definitive parameter set.**
 
 ```bash
-cargo leanvm aggregate --sphincs 245 --log-inv-rate 1 --repeat 3
+cargo leanvm aggregate --sphincs 850 --log-inv-rate 1 --repeat 3
 ```
 
 ```
-aggregation, 245 SPHINCS signatures
-  cycles (VM steps)           : 2,131,611 = 2^21.024
-    details                   : XOR 2^18.951 (23.8%)  MUL 2^18.93 (23.4%)  SET 2^18.845 (22.1%)  DEREF 2^18.711 (20.1%)  BLAKE2S 2^16.992 (6.1%)  JUMP 2^16.543 (4.5%)  MEMORY 2^21.46  BYTECODE 2^17.737  TOTAL_COMMITTED 2^26.301
-  proof size                  : 299.9 KiB
-  proving time                : 0.831 s ± 3.6%      peak memory 9.275 GiB
-  per signature               : 294.783 signatures/s
-  verifying                   : 5.225 ms
+aggregation, 850 SPHINCS signatures
+  cycles (VM steps)           : 2,040,659 = 2^20.961
+    details                   : SET 2^19.186 (29.2%)  XOR 2^18.694 (20.8%)  MUL 2^18.605 (19.5%)  BLAKE2S 2^17.998 (12.8%)  DEREF 2^17.625 (9.9%)  JUMP 2^17.266 (7.7%)  MEMORY 2^21.475  BYTECODE 2^17.982 TOTAL_COMMITTED 2^26.849
+  proof size                  : 331.9 KiB
+  proving time                : 1.04 s ± 2.1%      peak memory 14.013 GiB
+  per signature               : 817.658 signatures/s
+  verifying                   : 5.048 ms
 ```
 
 ### data availability
@@ -116,7 +116,7 @@ aggregation, 16 blobs
   proof size                  : 324.0 KiB
   proving time                : 0.986 s ± 11.1%      peak memory 12.534 GiB
   blob throughput             : 16.235 blobs/s, 2.029 MiB/s
-  verifying                   : 9.974 ms
+  verifying                   : 6.573 ms
 ```
 
 ### recursion
@@ -131,7 +131,7 @@ recursion 2→1, over leaves of 900 XMSS signatures
     details                   : MUL 2^17.823 (41.2%)  DEREF 2^16.964 (22.7%)  XOR 2^16.728 (19.3%)  SET 2^15.77 (9.9%)  JUMP 2^14.486 (4.1%)  BLAKE2S 2^13.932 (2.8%)  MEMORY 2^19.481  BYTECODE 2^17.737  TOTAL_COMMITTED 2^24.086
   proof size                  : 190.2 KiB
   proving time                : 0.272 s ± 5.3%      peak memory 8.388 GiB
-  verifying                   : 6 ms
+  verifying                   : 3.457 ms
 ```
 
 ### hashing
@@ -151,9 +151,9 @@ Flock BLAKE2s batch proving, 262,144 compressions (2^18 slots)
   other                           :      0.0 ms           0.0%
   ------------------------------------------
   prove TOTAL (witness excluded)  :    539.7 ms ± 3.3%   93.9%
-  verify                          :      2.5 ms
+  verify                          :      2.0 ms
   throughput                      :        485,765 compressions/s ± 3.3%
-  (~3327.2 XMSS/s equivalent at 146 compressions/signature)
+  (~3373.4 XMSS/s equivalent at 144 compressions/signature)
 ```
 
 ### Fibonacci
@@ -168,7 +168,7 @@ Fibonacci (in the exponent, i.e. modulo 2^64 - 1), N = 2,000,000
     details                   : MUL 2^20.944 (98.9%)  SET 2^13.288 (0.5%)  DEREF 2^12.967 (0.4%)  JUMP 2^10.968 (0.1%)  XOR 2^10.966 (0.1%)  MEMORY 2^20.96  BYTECODE 2^11.352  TOTAL_COMMITTED 2^25.26
   proof size                  : 286.0 KiB
   proving                     : 0.344 s ± 4.6%   6,181,087 cycles/s      peak memory 5.199 GiB
-  verifying                   : 4.689 ms
+  verifying                   : 2.218 ms
 ```
 
 ## SNARK machinery

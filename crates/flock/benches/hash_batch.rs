@@ -182,8 +182,8 @@ fn main() {
         prove.spread()
     );
     println!(
-        "  (~{:.1} XMSS/s equivalent at 146 compressions/signature)",
-        n as f64 / prove_s / 146.0
+        "  (~{:.1} XMSS/s equivalent at 144 compressions/signature)",
+        n as f64 / prove_s / 144.0
     );
 }
 
