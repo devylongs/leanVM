@@ -68,10 +68,29 @@ jobs:
             !formal/sphincs/.lake/packages/mathlib/.lake
           key: lake-sphincs-${{ runner.os }}-${{ hashFiles('formal/sphincs/lean-toolchain', 'formal/sphincs/lake-manifest.json') }}-${{ hashFiles('formal/sphincs/**/*.lean') }}
           restore-keys: lake-sphincs-${{ runner.os }}-${{ hashFiles('formal/sphincs/lean-toolchain', 'formal/sphincs/lake-manifest.json') }}-
+      # Each kernel-checked table (`decide +kernel`) takes most of the runner's
+      # memory, so it is built alone, before Lake builds the rest in parallel,
+      # with some swap as margin.
+      - name: Add swap
+        run: |
+          sudo fallocate -l 8G /swapfile.lean
+          sudo chmod 600 /swapfile.lean
+          sudo mkswap /swapfile.lean
+          sudo swapon /swapfile.lean
       - uses: leanprover/lean-action@v1
         with:
           lake-package-directory: formal/sphincs
           use-github-cache: false
+          build: false
+      - name: Build the kernel tables one at a time
+        working-directory: formal/sphincs
+        run: |
+          for m in Sphincs.H0FTab Sphincs.H0PTab Sphincs.H0NTab Sphincs.LifetimeCertificates; do
+            lake build "$m"
+          done
+      - name: Build
+        working-directory: formal/sphincs
+        run: lake build
       - name: Check the axiom footprint
         working-directory: formal/sphincs
         run: |
