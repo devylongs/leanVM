@@ -386,10 +386,6 @@ pub fn tables() -> [&'static dyn Table; N_TABLES] {
 /// Index of the BLAKE2s table in [`tables`].
 pub(crate) const BLAKE2S_TABLE: usize = 5;
 
-/// Each table's least log height: 0, but 3 for `BLAKE2s`, flock batching at least 8
-/// instances.
-pub const TABLE_LOG_FLOORS: [usize; N_TABLES] = [0, 0, 0, 0, 0, 3];
-
 /// The seven base addresses a `BLAKE2s` row reads: the four message cells, the
 /// chaining-value base, the output base (each of those two spans that cell and
 /// its successor) and the metadata cell. Recovered from the instruction, not

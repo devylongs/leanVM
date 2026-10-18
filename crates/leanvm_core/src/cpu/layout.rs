@@ -152,8 +152,7 @@ pub fn col_kappa_sources(log_bytecode: usize) -> Vec<Option<(usize, usize)>> {
     k[BFCNT] = Some((0, log_bytecode));
     // q_flock is `2^(K_LOG + n_blocks_log - LOG_PACKING)` F64 words, always ≥ 1
     // instance (a no-BLAKE2s program commits one padding instance), and tau_5 IS
-    // n_blocks_log (the announced-size certification uses the same floor), so this
-    // reproduces `qflock_kappa`.
+    // n_blocks_log, so this reproduces `qflock_kappa`.
     k[QFLOCK] = Some((2 + tables::BLAKE2S_TABLE, flock::hash::K_LOG - ::pcs::LOG_PACKING));
     for (t, table) in tables::tables().iter().enumerate() {
         let base = sch.base[t];
@@ -422,9 +421,9 @@ pub fn layout(prog: &[Op], log_mem: usize, rows: [usize; tables::N_TABLES], pi: 
     }
 }
 
-/// Every table's log height: the least that holds its rows, at least its floor.
+/// Every table's log height: the least that holds its rows.
 pub(crate) fn table_logs(rows: [usize; tables::N_TABLES]) -> [usize; tables::N_TABLES] {
-    let taus = std::array::from_fn(|t| crate::log2_ceil_usize(rows[t]).max(tables::TABLE_LOG_FLOORS[t]));
+    let taus = rows.map(crate::log2_ceil_usize);
     debug_assert_eq!(
         taus[tables::BLAKE2S_TABLE],
         crate::hash_flock::n_blocks_log(rows[tables::BLAKE2S_TABLE].max(1)),

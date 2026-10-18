@@ -406,9 +406,6 @@ pub const GLOBAL_COLUMN_BASES: [usize; N_TABLES] = {
     bases
 };
 
-/// Each table's least log height: 0, but 3 for BLAKE2s, flock batching at least 8 instances.
-const TABLE_LOG_FLOORS: [usize; N_TABLES] = [0, 0, 0, 0, 0, 3];
-
 pub fn build_layout<'a>(
     bytecode: &'a Bytecode,
     log_memory: u64,
@@ -424,11 +421,7 @@ pub fn build_layout<'a>(
     let log_bytecode = log_bytecode - BUS_BITS;
     let log_memory = log_memory as usize;
     // A table's height is the least power of two holding its rows.
-    let table_log_heights: Vec<usize> = table_rows
-        .iter()
-        .zip(TABLE_LOG_FLOORS)
-        .map(|(&rows, floor)| log2_ceil(rows).max(floor))
-        .collect();
+    let table_log_heights: Vec<usize> = table_rows.iter().map(|&rows| log2_ceil(rows)).collect();
 
     let tables = tables();
     let mut push = Vec::new();

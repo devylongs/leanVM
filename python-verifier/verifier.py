@@ -879,14 +879,11 @@ TABLE_WIDTHS = tuple(t.width for t in TABLES)
 GLOBAL_COLUMN_BASES = tuple(NUM_GLOBAL_COLUMNS + sum(TABLE_WIDTHS[:table]) for table in range(len(TABLES)))
 
 
-TABLE_LOG_FLOORS = (0, 0, 0, 0, 0, 3)  # each table's least log height: 0, but 3 for BLAKE2s, flock batching at least 8 instances
-
-
 def build_layout(bytecode: Sequence[K], log_memory: int, table_rows: Sequence[int]) -> Layout:
     log_bytecode = log2_strict(len(bytecode)) - BUS_BITS
     require(16 <= log_memory <= 32 and all(rows <= 2**32 for rows in table_rows) and 0 <= log_bytecode <= 32, "invalid announced table sizes")
     # A table's height is the least power of two holding its rows.
-    table_log_heights = tuple(max(log2_ceil(rows), floor) for rows, floor in zip(table_rows, TABLE_LOG_FLOORS, strict=True))
+    table_log_heights = tuple(log2_ceil(rows) for rows in table_rows)
 
     push: list[BusBlock] = []
     pull: list[BusBlock] = []

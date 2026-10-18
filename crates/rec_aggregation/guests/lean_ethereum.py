@@ -168,8 +168,7 @@ LOG2_BYTECODE_COLS = LOG2_BYTECODE_COLS_PLACEHOLDER
 # the evaluation frame. ETA_OFFSET[t] starts table t's disjoint range of zc_xi
 # powers; the three bus forms take ETA_FORM_BASE + side, the SAME three powers for
 # every table, and that sharing is what makes the batch's target derivable from the
-# three leaf claims. FLOORS[t] is the table's least log height (BLAKE2s is sized to
-# flock's instance count, >= 2^3).
+# three leaf claims.
 TABLE_XOR = 0
 TABLE_MUL = 1
 TABLE_SET = 2
@@ -177,7 +176,6 @@ TABLE_DEREF = 3
 TABLE_JUMP = 4
 TABLE_BLAKE2s = 5
 N_TABLES = N_TABLES_PLACEHOLDER
-FLOORS = FLOORS_PLACEHOLDER
 N_TABLE_COLS = N_TABLE_COLS_PLACEHOLDER
 TABLE_COLS_CAP = TABLE_COLS_CAP_PLACEHOLDER
 ETA_OFFSET = ETA_OFFSET_PLACEHOLDER
@@ -1540,22 +1538,16 @@ def verify_tables(fs0, fs1, cursor, pi_0, pi_1, zeta, g_bus_mu, dims_g, table_ro
     # claim still binds everything.
     bc_share = hint_witness("bytecode_val")
     # Each table's padding rows: their weight on a claim at zeta[..tau], dispatched on
-    # its hinted log height tau, which this certifies: the least holding its rows, or
-    # its floor. A table is at most the stack, so tau has an arm.
+    # its hinted log height tau, which this certifies to be the least holding its
+    # rows. A table is at most the stack, so tau has an arm.
     pad_weight = StackBuf(N_TABLES)
     for t in unroll(0, N_TABLES):
         tau_g = dims_g[GEN ** (t + 1)]
         assert log(tau_g) < N_COLUMN_LOGS
         rows = table_rows[GEN ** t]
         pad_weight[t], lead, rest = match(log(tau_g), range(0, N_COLUMN_LOGS), lambda tau: padding_weight(rows, zeta, tau))
-        if FLOORS[t] == 0:
-            assert lead == 1
-            assert rest != 0
-        else:
-            assert log(tau_g / GEN ** FLOORS[t]) < N_COLUMN_LOGS
-            if tau_g != GEN ** FLOORS[t]:
-                assert lead == 1
-                assert rest != 0
+        assert lead == 1
+        assert rest != 0
     idxc_tab = HeapBuf(SIZE_BITS)  # INDEX_MLE_FACTORS[t] = 1 + g^(2^t)
     for t in unroll(0, SIZE_BITS):
         idxc_tab[GEN ** t] = INDEX_MLE_FACTORS[t]
@@ -2108,7 +2100,7 @@ def verify_sub(pi_0, pi_1, seed_0, seed_1, g_logs_pow2, g_squares, defer_out):
     # integer WORDS; the shape-generic phases need logs as G-POWERS (loop bounds,
     # match scrutinees). log_mem is reassembled from its advice-decomposed bits, with
     # no hint and no g^j -> j lookup. A table's log height is advice, which
-    # verify_tables certifies to be the least holding its rows, above its floor.
+    # verify_tables certifies to be the least holding its rows.
     fs, log_mem_word, cursor = fs_next(fs, cursor)
     table_rows = HeapBuf(N_TABLES)
     for t in unroll(0, N_TABLES):

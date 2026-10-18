@@ -2485,7 +2485,6 @@ fn placeholder_map(kbc: usize) -> BTreeMap<String, String> {
     ps("INDEX_MLE_FACTORS", literals(&idxc));
     ps("N_CLAIMS", ncl.to_string());
     ps("N_TABLES", N_TABLES.to_string());
-    ps("FLOORS", literals(leanvm_core::tables::TABLE_LOG_FLOORS));
     // The table sumcheck's xi layout, from the native verifier's own numbers:
     // a disjoint range of identities per table, then THREE powers shared by every
     // table, one per bus side. Sharing is what lets the target be derived from the
