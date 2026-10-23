@@ -2571,19 +2571,20 @@ def is_child(node, kids, k: Const, bit):
 
 
 @inline
-def chain_step(at, pp, md, value, out, o: Const, i: Const, s: Const, lx: Const):
+def chain_step(at, pp, md, tags, value, out, o: Const, i: Const, s: Const, lx: Const):
     # The step of chain i leaving position s, into out[o:o+2]. A leanSPHINCS step's
     # address carries i and s; a leanXMSS one only s, at[s] computed once per key,
-    # i riding after the value.
+    # i riding after the value, read off `tags` so a dispatch arm names it rather
+    # than setting it again.
     if const(lx == 1):
-        blake2s([pp, at[s]], [value, i], out[o:o + 2], md=md)
+        blake2s([pp, at[s]], [value, tags[i]], out[o:o + 2], md=md)
     else:
         blake2s([pp, at + const(TW_CHAIN + i * HI_MUL + s * STEP_MUL)], [value, 0], out[o:o + 2], md=md)
     return
 
 
 @inline
-def walk(at, pp, md, tips, i: Const, k: Const, lx: Const):
+def walk(at, pp, md, tags, tips, i: Const, k: Const, lx: Const):
     # Walk WOTS+C chain i from position k to its end, the tip landing in tips[2i]
     # beside the unread upper half of its last hash.
     if const(k == CHAIN_STEPS):
@@ -2592,20 +2593,20 @@ def walk(at, pp, md, tips, i: Const, k: Const, lx: Const):
         value = hint_witness("chain_starts")
         for s in unroll(k, CHAIN_STEPS - 1):
             out = StackBuf(WORDS_PER_BLOCK)
-            chain_step(at, pp, md, value, out, 0, i, s, lx)
+            chain_step(at, pp, md, tags, value, out, 0, i, s, lx)
             value = out[0]
-        chain_step(at, pp, md, value, tips, 2 * i, i, CHAIN_STEPS - 1, lx)
+        chain_step(at, pp, md, tags, value, tips, 2 * i, i, CHAIN_STEPS - 1, lx)
     return
 
 
 @inline
-def walk_group(at, pp, md, tips, first: Const, n: Const, k: Const, lx: Const, powers, product, encoded):
+def walk_group(at, pp, md, tags, tips, first: Const, n: Const, k: Const, lx: Const, powers, product, encoded):
     # The n <= DIGIT_GROUP chains from `first` on, at the digits of k, one
     # dispatch for all of them. Folds the digits' sum into `product`, in the
     # exponent (`powers[s]` is GEN ** s), and the digits into `encoded`, where the
     # encoding digest holds them.
     for r in unroll(0, n):
-        walk(at, pp, md, tips, first + r, (k // CHAIN_LENGTH ** r) % CHAIN_LENGTH, lx)
+        walk(at, pp, md, tags, tips, first + r, (k // CHAIN_LENGTH ** r) % CHAIN_LENGTH, lx)
     return product * powers[DIGIT_SUMS[k]], encoded + const(k * CHAIN_LENGTH ** first)
 
 
@@ -2675,6 +2676,12 @@ def verify_lean_xmss(signer):
     powers = StackBuf(DIGIT_GROUP * CHAIN_STEPS + 1)
     for s in unroll(0, DIGIT_GROUP * CHAIN_STEPS + 1):
         powers[s] = GEN ** s
+    # The chain indices, both layers': a constant a dispatch arm sets lives inside a
+    # branch, so every arm that walks chain i sets i again. Written once here they are
+    # frame cells the arms read for nothing.
+    tags = StackBuf(LX_V)
+    for i in unroll(0, LX_V):
+        tags[i] = i
 
     for layer in unroll(0, 2):
         if const(layer == 0):
@@ -2706,11 +2713,11 @@ def verify_lean_xmss(signer):
         for p in unroll(0, LX_V // DIGIT_GROUP):
             group = hint_witness("digits")
             assert log(group) < DIGIT_GROUPS
-            digit_product, encoded = match(log(group), range(0, DIGIT_GROUPS), lambda k: walk_group(steps, pp, step_md[0], tips, DIGIT_GROUP * p, DIGIT_GROUP, k, 1, powers, digit_product, encoded))
+            digit_product, encoded = match(log(group), range(0, DIGIT_GROUPS), lambda k: walk_group(steps, pp, step_md[0], tags, tips, DIGIT_GROUP * p, DIGIT_GROUP, k, 1, powers, digit_product, encoded))
         group = hint_witness("digits")
         assert log(group) < CHAIN_LENGTH
         # The digits land where the digest already is, which is the assert.
-        digit_product, digest[0] = match(log(group), range(0, CHAIN_LENGTH), lambda k: walk_group(steps, pp, step_md[0], tips, LX_V - 1, 1, k, 1, powers, digit_product, encoded))
+        digit_product, digest[0] = match(log(group), range(0, CHAIN_LENGTH), lambda k: walk_group(steps, pp, step_md[0], tags, tips, LX_V - 1, 1, k, 1, powers, digit_product, encoded))
         assert digit_product == GEN ** LX_TARGET_SUM
 
         # The one-time leaf, then the path to the layer's root.
@@ -2907,6 +2914,8 @@ def verify_sig_lean_sphincs(signer, byte_bits):
     # and folding its digits in: their sums into a product that must be the target
     # sum, and the digits, each group where the digest holds it, into D.
     tips = StackBuf(2 * SP_V)
+    # A leanSPHINCS chain index rides its step's address, so the chain-index table a
+    # leanXMSS walk reads is unused here and `powers` stands in for it.
     powers = StackBuf(DIGIT_GROUP * CHAIN_STEPS + 1)
     for s in unroll(0, DIGIT_GROUP * CHAIN_STEPS + 1):
         powers[s] = GEN ** s
@@ -2915,12 +2924,12 @@ def verify_sig_lean_sphincs(signer, byte_bits):
     for p in unroll(0, SP_V // DIGIT_GROUP):
         group = hint_witness("digits")
         assert log(group) < DIGIT_GROUPS
-        digit_product, encoded = match(log(group), range(0, DIGIT_GROUPS), lambda k: walk_group(idx, pp, step_md[0], tips, DIGIT_GROUP * p, DIGIT_GROUP, k, 0, powers, digit_product, encoded))
+        digit_product, encoded = match(log(group), range(0, DIGIT_GROUPS), lambda k: walk_group(idx, pp, step_md[0], powers, tips, DIGIT_GROUP * p, DIGIT_GROUP, k, 0, powers, digit_product, encoded))
     # The chain the groups leave over.
     group = hint_witness("digits")
     assert log(group) < CHAIN_LENGTH
     # The digits land where D already is, which is the assert.
-    digit_product, encoding[0] = match(log(group), range(0, CHAIN_LENGTH), lambda k: walk_group(idx, pp, step_md[0], tips, SP_V - 1, 1, k, 0, powers, digit_product, encoded))
+    digit_product, encoding[0] = match(log(group), range(0, CHAIN_LENGTH), lambda k: walk_group(idx, pp, step_md[0], powers, tips, SP_V - 1, 1, k, 0, powers, digit_product, encoded))
     assert digit_product == GEN ** SP_TARGET_SUM
     # The one-time leaf, then the path from it to the public key's root.
     leaf = StackBuf(WORDS_PER_BLOCK)
