@@ -151,7 +151,8 @@ def HeapBuf(n) -> _Elt:
 
 def StackBuf(n: int) -> _Elt:
     """Allocate `n` consecutive frame (stack) cells. A size-2 StackBuf holds a
-    256-bit value and is a valid `blake2s` operand."""
+    256-bit value and is a valid `keccak` operand; a size-13 one holds a sponge
+    state."""
     _ = n
     return _Elt()
 
@@ -197,40 +198,51 @@ def hint_f192_limbs(dest, value) -> None:
     _ = dest, value
 
 
-def blake2s(
+def keccak(
     a,
     b,
     out,
     *,
-    cv=None,
-    counter: Optional[int] = None,
-    final: Optional[int] = None,
-    last_node: int = 0,
-    md=None,
+    tail=None,
+    len: Optional[int] = None,
+    cap=None,
 ) -> None:
-    """One standard BLAKE2s compression of the two 256-bit message operands
-    `a`, `b`, written into the 2-cell run `out` (write-once: if `out` was
-    already written, this asserts it equals the chaining value).
+    """The leanVM hash (Keccak-256) of at most 128 bytes, one `KECCAK`
+    instruction. The message cells are `a` (2 cells), `b` (2 cells) and `tail`
+    (4 cells, none when omitted), and the message is their first `len` bytes
+    (all of them by default). A cell wholly past `len` must be a literal 0 (a
+    compile error otherwise); the bytes past `len` in the cell where the message
+    ends must be zero, which the circuit does not enforce. `out` receives the
+    13-cell sponge state, whose first two cells are the digest, or just the
+    digest when it is a 2-cell run (write-once: if `out` was already written,
+    this asserts it equals the result).
 
-    With no keywords this hashes exactly 64 bytes: the parameterized BLAKE2s-256
-    initial chaining value, byte counter 64, final-block flag set. That is
-    `blake2s(a || b)`, the form every Fiat-Shamir step and Merkle node uses.
+    `cap=` makes it the Fiat-Shamir duplex step in overwrite mode, with no
+    padding: the eight message cells overwrite lanes 0..16, and lanes 16..25,
+    the transcript's capacity, are the last five cells of `cap`, a previous
+    13-cell output (or a 5-cell run). Lane 16 is in Keccak-256's 17-lane rate,
+    but the transcript keeps it.
 
-    For a longer message, drive the blocks yourself. `counter` is the CUMULATIVE
-    byte count through this block (`64 * whole_blocks_before + bytes_in_this_block`)
-    and `final=1` marks the last block; `cv` carries the previous block's output
-    and requires one of `counter`, `final`, `last_node` or `md`. Setting any of
-    `counter`, `final` or `last_node` makes `final` default
-    to 0, so a single short block needs `counter=<len>, final=1`. Bytes past the
-    block's real length must be zero-filled by the program. `last_node` is
-    BLAKE2s's tree-mode `f1` and is 0 everywhere here.
+    Message and output operands are StackBufs or slices `buf[lo:hi]` of the right
+    size, or lists of words (a literal `0` is known to be zero); heap runs are
+    bridged through the stack, one DEREF per cell, a 13-cell `out` included."""
+    _ = a, b, out, tail, len, cap
 
-    `md` is the whole 128-bit metadata word as a value the program computed, for
-    a hash whose block count is only known at run time. It replaces `counter`,
-    `final` and `last_node` (giving both is an error), and it must not name a
-    cell of `out`.
 
-    Message, chaining-value, and output operands are size-2 StackBufs or
-    2-cell slices `buf[lo:hi]` of larger StackBufs or HeapBufs (heap inputs are
-    bridged through the stack, one DEREF per cell)."""
-    _ = a, b, out, cv, counter, final, last_node, md
+def keccak_cells(
+    cells,
+    out,
+    *,
+    state=None,
+    len: Optional[int] = None,
+    final: Optional[int] = None,
+) -> None:
+    """The leanVM hash of the message `cells` holds (a StackBuf, a slice with
+    compile-time bounds, a list of words, or a comprehension over `unroll`), its
+    first `len` bytes (all of them by default, and past `len` as for `keccak`),
+    136 bytes a `KECCAK` instruction. `out` is as for `keccak`.
+
+    `state` continues a hash from a previous 13-cell output whose message so far
+    is a whole number of 17-cell block pairs. `final=0` absorbs the cells
+    zero-extended to whole blocks, with no padding."""
+    _ = cells, out, state, len, final

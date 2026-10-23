@@ -4,7 +4,7 @@
 //! A layer's message digest is `Th(P, A, M | R)`, read as `DIGITS` digits of `w`
 //! bits, little endian. It is a codeword when its last `ZERO_DIGITS` digits are
 //! zero, so those have no chain, and the other `v` sum to `T`. The signer grinds the
-//! randomizer `R` until it is, one compression a trial.
+//! randomizer `R` until it is, one permutation a trial.
 
 use crate::lean_xmss::*;
 
@@ -51,17 +51,16 @@ pub fn wots_leaf_hash(pp: &PublicParam, layer: usize, e: u32, ends: &[Digest; V]
 /// The digest key `e` on `layer` signs: `Th(P, A, M | R)`, `M` the message at the
 /// bottom and the bottom root at the top.
 pub fn message_digest(pp: &PublicParam, layer: usize, e: u32, randomizer: &Randomizer, message: &[u8]) -> Digest {
-    digest_prefix(pp, layer, e, message).hash(randomizer)[..N]
+    digest_prefix(pp, layer, e, message).update(randomizer).finalize()[..N]
         .try_into()
         .unwrap()
 }
 
-/// `P | A | M`, which fills the bottom digest's first block, so a randomizer trial
-/// compresses only the block holding `R`.
-fn digest_prefix(pp: &PublicParam, layer: usize, e: u32, message: &[u8]) -> primitives::hash::Prefix {
+/// `P | A | M`, the hasher a randomizer trial continues.
+fn digest_prefix(pp: &PublicParam, layer: usize, e: u32, message: &[u8]) -> primitives::hash::Hasher {
     let mut prefix = hasher(pp, &tweak(TWEAK_MSG, layer_hi(layer, 0), e));
     prefix.update(message);
-    prefix.prefix()
+    prefix
 }
 
 /// The digest's first `v` digits, if it is a codeword.
@@ -95,7 +94,7 @@ pub fn wots_sign(
     let trial = |c: u64| base.wrapping_add(u128::from(c)).to_le_bytes();
     let prefix = digest_prefix(pp, layer, e, message);
     let admits = |c: u64| {
-        let digest = prefix.hash(&trial(c));
+        let digest = prefix.clone().update(&trial(c)).finalize();
         codeword(&digest[..N].try_into().unwrap()).is_some()
     };
     let c = (0..MAX_RANDOMIZER_TRIALS)

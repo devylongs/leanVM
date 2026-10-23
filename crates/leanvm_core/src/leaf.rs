@@ -24,7 +24,7 @@ pub enum Coord {
     /// A committed column, value `col[z]`.
     Col(usize),
     /// The free increment `g^k · col[z]` (a virtual column, §sec:vm): `k = 1` for the
-    /// count/state steps, `k ∈ {1,2,3}` for BLAKE2s's consecutive-word successors.
+    /// count/state steps, `k ≤ 12` for a KECCAK state's consecutive cells.
     GCol(usize, u32),
     /// The product `g^k · col_a[z] · col_b[z]` of two committed columns. An address
     /// is `fp·g^o`, so this carries one on the bus without committing it: the
@@ -35,7 +35,7 @@ pub enum Coord {
     Index,
     /// A public column (the bytecode program, §sec:e2e-bc): not committed; both parties form
     /// its MLE directly, so it raises no claim. Shared rather than owned: push and
-    /// pull carry the same eight columns, tens of megabytes at production sizes.
+    /// pull carry the same eleven columns, tens of megabytes at production sizes.
     Public(Arc<Vec<F64>>),
     /// A sum of `Const`/`Col`/`GCol`/`Prod` terms: any degree-2 form over the
     /// table's columns, which is all §sec:m3 asks of a coordinate. This is what
@@ -124,7 +124,7 @@ pub fn fingerprint_weights(alphas: &[F192]) -> Vec<F192> {
     w
 }
 
-/// Bits indexing a bus tuple's coordinates: `m = 11` coordinates live in the
+/// Bits indexing a bus tuple's coordinates: `m = 14` coordinates live in the
 /// `2^4` slots of the bytecode encoding (§sec:m3, §sec:e2e-bc).
 pub const N_TUPLE_BITS: usize = 4;
 
@@ -248,9 +248,9 @@ impl LeafBlock<'_> {
         let (real_out, padding) = out.split_at_mut(real);
         // A padding row's leaf is the identity, so it leaves the product alone.
         padding.fill(F192::ONE);
-        #[cfg(all(target_arch = "x86_64", target_feature = "avx512f", target_feature = "vpclmulqdq"))]
-        let done = self.fill8(z0, real_out, cols);
-        #[cfg(not(all(target_arch = "x86_64", target_feature = "avx512f", target_feature = "vpclmulqdq")))]
+        #[cfg(all(target_arch = "x86_64", target_feature = "avx2", target_feature = "vpclmulqdq"))]
+        let done = self.fill_lanes(z0, real_out, cols);
+        #[cfg(not(all(target_arch = "x86_64", target_feature = "avx2", target_feature = "vpclmulqdq")))]
         let done = 0;
         let mut index = g_pow(z0 + done);
         for (i, slot) in real_out.iter_mut().enumerate().skip(done) {
@@ -259,40 +259,58 @@ impl LeafBlock<'_> {
         }
     }
 
-    /// [`fill`](Self::fill) eight rows at a time, every term one lane-wise mixed
-    /// product ([`primitives::field::x8`]); returns how many rows it wrote.
-    #[cfg(all(target_arch = "x86_64", target_feature = "avx512f", target_feature = "vpclmulqdq"))]
-    fn fill8(&self, z0: usize, out: &mut [F192], cols: &[&[F64]]) -> usize {
-        use primitives::field::x8::{F64x8, F192x8, Mixed8};
-        let eight = |source: &[F64], z: usize| F64x8::load(source[z..z + 8].try_into().unwrap());
-        // `g^z` for the eight rows, stepped by `g^8`.
-        let mut index = F64x8::new(std::array::from_fn(|i| g_pow(z0 + i)));
-        let step = F64x8::splat(g_pow(8));
-        let coeffs: Vec<F192x8> = self
+    /// [`fill`](Self::fill) [`lanes::N`] rows at a time, every term one lane-wise mixed
+    /// product; returns how many rows it wrote.
+    #[cfg(all(target_arch = "x86_64", target_feature = "avx2", target_feature = "vpclmulqdq"))]
+    fn fill_lanes(&self, z0: usize, out: &mut [F192], cols: &[&[F64]]) -> usize {
+        use lanes::{E, K, Mixed, N};
+        let load = |source: &[F64], z: usize| K::load(source[z..z + N].try_into().unwrap());
+        // `g^z` for the `N` rows, stepped by `g^N`.
+        let mut index = K::new(std::array::from_fn(|i| g_pow(z0 + i)));
+        let step = K::splat(g_pow(N));
+        let coeffs: Vec<E> = self
             .terms
             .iter()
             .map(|t| match t {
-                Term::Col(_, c) | Term::Prod(_, _, c) | Term::Index(c) | Term::Public(_, c) => F192x8::splat(*c),
+                Term::Col(_, c) | Term::Prod(_, _, c) | Term::Index(c) | Term::Public(_, c) => E::splat(*c),
             })
             .collect();
-        let constant = F192x8::splat(self.const_part);
-        let (chunks, _) = out.as_chunks_mut::<8>();
+        let constant = E::splat(self.const_part);
+        let (chunks, _) = out.as_chunks_mut::<N>();
         for (k, slot) in chunks.iter_mut().enumerate() {
-            let z = z0 + 8 * k;
-            let mut acc = Mixed8::ZERO;
+            let z = z0 + N * k;
+            let mut acc = Mixed::ZERO;
             for (t, &c) in self.terms.iter().zip(&coeffs) {
                 match t {
-                    Term::Col(i, _) => acc.add(c, eight(cols[*i], z)),
-                    Term::Prod(i, j, _) => acc.add(c, eight(cols[*i], z) * eight(cols[*j], z)),
+                    Term::Col(i, _) => acc.add(c, load(cols[*i], z)),
+                    Term::Prod(i, j, _) => acc.add(c, load(cols[*i], z) * load(cols[*j], z)),
                     Term::Index(_) => acc.add(c, index),
-                    Term::Public(vals, _) => acc.add(c, eight(vals, z)),
+                    Term::Public(vals, _) => acc.add(c, load(vals, z)),
                 }
             }
             index = index * step;
             (acc.reduce() + constant).store(slot);
         }
-        8 * chunks.len()
+        N * chunks.len()
     }
+}
+
+/// The lane-wise kernels [`LeafBlock::fill_lanes`] runs on: eight lanes with AVX-512
+/// ([`primitives::field::x8`]), four without ([`primitives::field::x4`]).
+#[cfg(all(target_arch = "x86_64", target_feature = "avx512f", target_feature = "vpclmulqdq"))]
+mod lanes {
+    pub(super) use primitives::field::x8::{F64x8 as K, F192x8 as E, Mixed8 as Mixed};
+    pub(super) const N: usize = 8;
+}
+#[cfg(all(
+    target_arch = "x86_64",
+    target_feature = "avx2",
+    target_feature = "vpclmulqdq",
+    not(target_feature = "avx512f")
+))]
+mod lanes {
+    pub(super) use primitives::field::x4::{F64x4 as K, F192x4 as E, Mixed4 as Mixed};
+    pub(super) const N: usize = 4;
 }
 
 /// `dst[i] = ∏ src[4i..4i+4]`, an incomplete last four-tuple padded with the identity.
@@ -403,8 +421,16 @@ pub fn build_leaves(sides: [(&[Block], &Layout, &[F192], F192); 3], cols: &[&[F6
             let (leaves, fours, sixteens) = (&mut stage[..len], &mut stage4[..len / 4], &mut stage16[..len / 16]);
             for blk in &groups[group] {
                 blk.fill(z0, leaves, cols);
-                gkr::products_into(leaves, fours);
-                gkr::products_into(fours, sixteens);
+                // Past the block's real rows every leaf, and so every tuple's product, is the identity.
+                let live = if gkr::SKIP_IDENTITY {
+                    blk.rows.saturating_sub(z0).next_multiple_of(16).min(len)
+                } else {
+                    len
+                };
+                gkr::products_into(&leaves[..live], &mut fours[..live / 4]);
+                gkr::products_into(&fours[..live / 4], &mut sixteens[..live / 16]);
+                fours[live / 4..].fill(F192::ONE);
+                sixteens[live / 16..].fill(F192::ONE);
                 let at = blk.offset + z0;
                 // SAFETY: a block's chunks are disjoint ranges of its side's leaves, blocks
                 // are disjoint, and a chunk owns the tuples it starts, `at` being a multiple
@@ -733,7 +759,7 @@ fn decompose_prove(
 }
 
 /// Selector bits of the stacked bytecode polynomial: the public encoding
-/// columns (opcode + seven operand/immediate slots = eight) stack along
+/// columns (opcode + ten operand/immediate slots = eleven) stack along
 /// `2^N_BYTECODE_SELECTORS` slots. A column's slot is its bus tuple coordinate,
 /// which is what fixes the width at sixteen rather than at the column count.
 pub const N_BYTECODE_SELECTORS: usize = 4;
@@ -743,7 +769,7 @@ pub const N_BYTECODE_SELECTORS: usize = 4;
 /// bus tuple coordinate.
 pub const BYTECODE_PUBLIC_SLOT: usize = 3;
 
-/// The stacked bytecode polynomial as a dense table: eight public encoding
+/// The stacked bytecode polynomial as a dense table: eleven public encoding
 /// columns at their tuple coordinates, padded to sixteen selector slots. One
 /// multilinear polynomial B̃ in `κ_bc + 4` variables, which is what a bus leaf
 /// reads at `(ζ_lo, α⃗)` (§sec:e2e-bc); the outermost verifier evaluates it.

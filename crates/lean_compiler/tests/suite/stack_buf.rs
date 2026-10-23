@@ -1,42 +1,55 @@
 //! `StackBuf`: a run of consecutive frame (stack) cells in the zkDSL. Indexed
 //! reads/writes go straight to `base+k` (no heap deref), and a size-2 `StackBuf`
-//! is a `blake2s` operand: its two canonical 128-bit cells hold the 256-bit value, so
-//! `blake2s(a, b, out)` reads them in place with no copies (a self-hash
-//! `blake2s(h, h, out)` aliases one pair into both input operands) and writes
-//! the digest into the pre-allocated pair `out`.
+//! is a `keccak` operand: its two canonical 128-bit cells hold the 256-bit value, so
+//! `keccak(a, b, out)` reads them in place with no copies (a self-hash
+//! `keccak(h, h, out)` aliases one pair into both input operands) and writes
+//! the digest into `out`.
 //!
 //! Since these DSL scalars are K-embedded F192 cells, a `StackBuf(2)` written
-//! cell-by-cell holds the flock words `[v0, 0, v1, 0]`
-//!: the reference `compress` is fed that lane layout.
+//! cell-by-cell holds the lanes `[v0, 0, v1, 0]`.
 
 use lean_compiler::{compile, parse};
-use leanvm_core::cpu::{Op, prove, verify};
-use leanvm_core::hash_flock::{compression, digest, metadata, unpack_metadata};
-use leanvm_core::vmhash::compress;
+use leanvm_core::cpu::{prove, verify};
 use primitives::field::{F64, F192, g_pow};
 
-use crate::common::mix;
+use crate::common::{f192_lit, mix};
 
-/// The two 128-bit digest cells of `compress(a, b)` as `F192`s (lo = word 0/2,
-/// hi = word 1/3): what a `blake2s(...)` output `StackBuf(2)` holds cell-by-cell.
-fn digest_cells(a: [F64; 4], b: [F64; 4]) -> [F192; 2] {
-    let d = compress(a, b);
-    [F192::new(d[0].0, d[1].0, 0), F192::new(d[2].0, d[3].0, 0)]
+/// The digest cells of the hash of `bytes`: what a `keccak(...)` output `StackBuf(2)` holds
+/// cell-by-cell (lo = word 0/2, hi = word 1/3).
+fn hash_cells(bytes: &[u8]) -> [F192; 2] {
+    let d = primitives::hash::hash(bytes);
+    let word = |o: usize| u64::from_le_bytes(d[o..o + 8].try_into().unwrap());
+    [F192::new(word(0), word(8), 0), F192::new(word(16), word(24), 0)]
 }
 
-/// A size-2 `StackBuf` fed to `blake2s` as a self-hash `blake2s(h, h)`, then the
+/// The bytes of cells each holding one small scalar in its low lane.
+fn scalar_cells(values: impl IntoIterator<Item = u64>) -> Vec<u8> {
+    values
+        .into_iter()
+        .flat_map(|v| v.to_le_bytes().into_iter().chain(0u64.to_le_bytes()))
+        .collect()
+}
+
+/// Prove and verify `src` against the public input `want`.
+fn proves(src: &str, want: [F192; 2]) {
+    let program = compile(&parse(src).expect("parse"));
+    let (proof, _) = prove(&program, want, leanvm_core::pcs::TEST_LOG_INV_RATE).unwrap();
+    verify(&program, &want, &proof).expect("verifies");
+}
+
+/// A size-2 `StackBuf` fed to `keccak` as a self-hash `keccak(h, h)`, then the
 /// digest's two 128-bit cells published to `m[0], m[1]`. Proves and verifies, and
 /// a wrong published digest is rejected: so the whole path (StackBuf load →
-/// aliased blake2s → stack read → publish) is exercised end-to-end.
+/// aliased keccak → stack read → publish) is exercised end-to-end.
 #[test]
-fn stack_buf_blake2s_self_hash() {
+fn stack_buf_keccak_self_hash() {
     let src = "\
 def main():
     a = StackBuf(2)
     a[0] = 5
     a[1] = 7
     c = StackBuf(2)
-    blake2s(a, a, c)
+    keccak(a, a, c)
     p = 1
     p[1] = c[0]
     p[GEN] = c[1]
@@ -44,133 +57,163 @@ def main():
 ";
     let program = compile(&parse(src).expect("parse"));
 
-    // Each cell holds one scalar in its low lane, so the hashed words are [5,0,7,0].
-    let h = [F64(5), F64(0), F64(7), F64(0)];
-    let want = digest_cells(h, h);
+    // Each cell holds one scalar in its low lane.
+    let want = hash_cells(&scalar_cells([5, 7, 5, 7]));
 
     let (proof, _) = prove(&program, want, leanvm_core::pcs::TEST_LOG_INV_RATE).unwrap();
-    assert_eq!(mix(src, want)[5], 1, "one BLAKE2s instruction");
+    assert_eq!(mix(src, want)[5], 1, "one KECCAK instruction");
     verify(&program, &want, &proof).expect("StackBuf self-hash verifies");
 }
 
-/// Optional BLAKE2s metadata and a memory-supplied chaining value reproduce a
-/// standard two-block (80-byte) BLAKE2s hash.
+/// A 304-byte message is three blocks: a block pair of seventeen cells absorbed with no
+/// padding, the second block starting halfway through the ninth cell, then a final
+/// block from the state carried between them.
 #[test]
-fn blake2s_keywords_standard_multiblock() {
+fn keccak_two_blocks() {
     let src = "\
 def main():
-    block0 = [1, 2, 3, 4]
-    tail = [5, 0, 0, 0]
-    cv = StackBuf(2)
-    blake2s(block0[0:2], block0[2:4], cv, counter=64, final=0)
+    pair = StackBuf(17)
+    for k in unroll(0, 17):
+        pair[k] = const(k + 1)
+    st = StackBuf(13)
+    keccak_cells(pair, st, final=0)
     out = StackBuf(2)
-    blake2s(tail[0:2], tail[2:4], out, cv=cv, counter=80, final=1)
+    keccak_cells([18, 19], out, state=st)
     p = 1
     p[1] = out[0]
     p[GEN] = out[1]
     return
 ";
-    let program = compile(&parse(src).expect("parse"));
-    let mut input = Vec::new();
-    for value in 1u64..=5 {
-        input.extend_from_slice(&value.to_le_bytes());
-        input.extend_from_slice(&0u64.to_le_bytes());
-    }
-    let d = primitives::hash::hash(&input);
-    let word = |o: usize| u64::from_le_bytes(d[o..o + 8].try_into().unwrap());
-    let want = [F192::new(word(0), word(8), 0), F192::new(word(16), word(24), 0)];
-    let (proof, _) = prove(&program, want, leanvm_core::pcs::TEST_LOG_INV_RATE).unwrap();
-    assert_eq!(mix(src, want)[5], 2);
-    verify(&program, &want, &proof).expect("standard two-block BLAKE2s verifies");
+    let want = hash_cells(&scalar_cells(1..=19));
+    assert_eq!(mix(src, want)[5], 3);
+    proves(src, want);
 }
 
-/// The same 80-byte hash with its second block's metadata computed at run time,
-/// the shape a hash of runtime length needs: the counter's high part is a word
-/// the program produced and its low part a compile-time constant, and their set
-/// bits are disjoint, so one `XOR` is their integer sum (doc
-/// §sec:prog-byte-counter). The hint stands in for the high part a real absorb
-/// loop derives from its own counter.
+/// A message on either side of a block's end, 135 and 136 bytes: the padding's last
+/// byte in lane 16 of the first block's ninth cell, or the padding a second block,
+/// odd, its first byte in that cell's high lane.
 #[test]
-fn blake2s_runtime_metadata_matches_the_standard_hash() {
+fn keccak_full_final_block() {
     let src = "\
 def main():
-    block0 = [1, 2, 3, 4]
-    tail = [5, 0, 0, 0]
-    cv = StackBuf(2)
-    blake2s(block0[0:2], block0[2:4], cv, counter=64, final=0)
-    high = hint_witness(\"high\")
-    assert high == 64
+    m = StackBuf(9)
+    for k in unroll(0, 9):
+        m[k] = const(k + 1)
+    one = StackBuf(2)
+    keccak_cells(m, one, len=135)
+    two = StackBuf(2)
+    keccak_cells(m, two, len=136)
+    assert two[0] == TWO_0
+    assert two[1] == TWO_1
+    p = 1
+    p[1] = one[0]
+    p[GEN] = one[1]
+    return
+";
+    let mut bytes = scalar_cells(1..=9);
+    let two = hash_cells(&bytes[..136]);
+    bytes.truncate(135);
+    let src = src
+        .replace("TWO_0", &f192_lit(two[0]))
+        .replace("TWO_1", &f192_lit(two[1]));
+    proves(&src, hash_cells(&bytes));
+}
+
+/// A message ending inside a cell: 52 bytes, the padding's first byte at byte 4
+/// of lane 6, XORed into the program's own word.
+#[test]
+fn keccak_pad_inside_a_word() {
+    let src = "\
+def main():
+    ctr = 305419896
     out = StackBuf(2)
-    blake2s(tail[0:2], tail[2:4], out, cv=cv, md=high + f192(16, 4294967295, 0))
+    keccak([1, 2], [3, ctr], out, len=52)
     p = 1
     p[1] = out[0]
     p[GEN] = out[1]
     return
 ";
-    let mut program = compile(&parse(src).expect("parse"));
-    program.set_witness("high", vec![vec![F192::new(64, 0, 0)]]);
-    let mut input = Vec::new();
-    for value in 1u64..=5 {
-        input.extend_from_slice(&value.to_le_bytes());
-        input.extend_from_slice(&0u64.to_le_bytes());
-    }
-    let d = primitives::hash::hash(&input);
-    let word = |o: usize| u64::from_le_bytes(d[o..o + 8].try_into().unwrap());
-    let want = [F192::new(word(0), word(8), 0), F192::new(word(16), word(24), 0)];
-    let (proof, _) = prove(&program, want, leanvm_core::pcs::TEST_LOG_INV_RATE).unwrap();
-    verify(&program, &want, &proof).expect("a runtime metadata word hashes to the standard digest");
+    let mut bytes = scalar_cells(1..=3);
+    bytes.extend_from_slice(&305419896u32.to_le_bytes());
+    proves(src, hash_cells(&bytes));
 }
 
+/// `keccak_cells` hashes a whole run: 20 cells, 320 bytes, are three blocks, the last
+/// (block 2) even, and a heap run of 16 is two.
 #[test]
-fn blake2s_counter_accepts_full_u64_range() {
+fn keccak_cells_hashes_the_run() {
     let src = "\
 def main():
-    block = [1, 2, 3, 4]
+    run = StackBuf(20)
+    for k in unroll(0, 20):
+        run[k] = const(k + 1)
     out = StackBuf(2)
-    counter = 18446744073709551615 // 1
-    blake2s(block[0:2], block[2:4], out, counter=counter, final=1)
+    keccak_cells(run, out)
+    hb = HeapBuf(16)
+    for k in unroll(0, 16):
+        hb[GEN ** k] = const(k + 1)
+    heap_out = StackBuf(2)
+    keccak_cells(hb[0:16], heap_out)
+    assert heap_out[0] == HEAP_0
+    assert heap_out[1] == HEAP_1
+    p = 1
+    p[1] = out[0]
+    p[GEN] = out[1]
     return
 ";
-    let program = compile(&parse(src).expect("parse"));
-    // The metadata is a memory operand, so what carries the counter is the `SET`
-    // immediate that wrote the cell the instruction reads.
-    let md = program
-        .prog
-        .iter()
-        .find_map(|op| match op {
-            Op::Blake2s { md, .. } => Some(*md),
-            _ => None,
-        })
-        .expect("BLAKE2s instruction");
-    let metadata = program
-        .prog
-        .iter()
-        .find_map(|op| match op {
-            Op::Set { o, k } if *o == md => Some(*k),
-            _ => None,
-        })
-        .expect("the metadata cell's SET");
-    assert_eq!(unpack_metadata(metadata), (u64::MAX, u32::MAX, 0));
+    let heap = hash_cells(&scalar_cells(1..=16));
+    let src = src
+        .replace("HEAP_0", &f192_lit(heap[0]))
+        .replace("HEAP_1", &f192_lit(heap[1]));
+    proves(&src, hash_cells(&scalar_cells(1..=20)));
 }
 
+/// A list comprehension names scattered cells as a message, here every second cell of a
+/// run, with no copies: three blocks reading the cells where they lie.
 #[test]
-#[should_panic(expected = "counter= 18446744073709551616 does not fit in u64")]
-fn blake2s_counter_rejects_values_above_u64() {
+fn keccak_cells_of_a_comprehension() {
     let src = "\
 def main():
-    block = [1, 2, 3, 4]
+    run = StackBuf(40)
+    for k in unroll(0, 40):
+        run[k] = const(k + 1)
     out = StackBuf(2)
-    blake2s(block[0:2], block[2:4], out, counter=18446744073709551616, final=1)
+    keccak_cells([run[2 * k] for k in unroll(0, 20)], out)
+    p = 1
+    p[1] = out[0]
+    p[GEN] = out[1]
     return
 ";
-    compile(&parse(src).expect("parse"));
+    proves(src, hash_cells(&scalar_cells((0..20).map(|k| 2 * k + 1))));
 }
 
-/// A default IV first materialized in an untaken runtime branch must not leak
-/// into the post-join lowering state. Both executions must initialize the IV
-/// on the path that reaches the second hash.
+/// A state carried through the heap, the shape a hash in a runtime loop has: the
+/// first block pair writes its 13-cell output to a heap run, the final block reads it
+/// back as its `state`.
 #[test]
-fn blake2s_default_iv_after_runtime_branch() {
+fn keccak_state_through_the_heap() {
+    let src = "\
+def main():
+    pair = StackBuf(17)
+    for k in unroll(0, 17):
+        pair[k] = const(k + 1)
+    chain = HeapBuf(13)
+    keccak_cells(pair, chain[0:13], final=0)
+    out = StackBuf(2)
+    keccak_cells([18, 19], out, state=chain[0:13])
+    p = 1
+    p[1] = out[0]
+    p[GEN] = out[1]
+    return
+";
+    proves(src, hash_cells(&scalar_cells(1..=19)));
+}
+
+/// A padding run first materialized in an untaken runtime branch must not leak
+/// into the post-join lowering state. Both executions must initialize it on the
+/// path that reaches the second hash.
+#[test]
+fn keccak_pad_run_after_runtime_branch() {
     let src = "\
 def main():
     flag = StackBuf(1)
@@ -178,27 +221,27 @@ def main():
     a = [1, 2, 3, 4]
     if flag[0] == 1:
         ignored = StackBuf(2)
-        blake2s(a[0:2], a[2:4], ignored)
+        keccak(a[0:2], a[2:4], ignored)
     out = StackBuf(2)
-    blake2s(a[0:2], a[2:4], out)
+    keccak(a[0:2], a[2:4], out)
     p = 1
     p[1] = out[0]
     p[GEN] = out[1]
     return
 ";
-    let want = digest_cells([F64(1), F64(0), F64(2), F64(0)], [F64(3), F64(0), F64(4), F64(0)]);
+    let want = hash_cells(&scalar_cells(1..=4));
     for flag in [0, 1] {
         let mut program = compile(&parse(src).expect("parse"));
         program.set_witness("flag", vec![vec![F192::new(flag, 0, 0)]]);
         let (proof, _) = prove(&program, want, leanvm_core::pcs::TEST_LOG_INV_RATE).unwrap();
-        verify(&program, &want, &proof).expect("post-join default IV is initialized on both paths");
+        verify(&program, &want, &proof).expect("post-join padding run is initialized on both paths");
     }
 }
 
-/// Each mutually exclusive branch gets a path-local IV initialization when no
-/// dominating default-IV hash exists before the branch.
+/// Each mutually exclusive branch gets a path-local padding run when no
+/// dominating fresh hash exists before the branch.
 #[test]
-fn blake2s_default_iv_in_both_runtime_branches() {
+fn keccak_pad_run_in_both_runtime_branches() {
     let src = "\
 def main():
     flag = StackBuf(1)
@@ -206,88 +249,55 @@ def main():
     a = [1, 2, 3, 4]
     out = StackBuf(2)
     if flag[0] == 1:
-        blake2s(a[0:2], a[2:4], out)
+        keccak(a[0:2], a[2:4], out)
     else:
-        blake2s(a[0:2], a[2:4], out)
+        keccak(a[0:2], a[2:4], out)
     p = 1
     p[1] = out[0]
     p[GEN] = out[1]
     return
 ";
-    let want = digest_cells([F64(1), F64(0), F64(2), F64(0)], [F64(3), F64(0), F64(4), F64(0)]);
+    let want = hash_cells(&scalar_cells(1..=4));
     for flag in [0, 1] {
         let mut program = compile(&parse(src).expect("parse"));
         program.set_witness("flag", vec![vec![F192::new(flag, 0, 0)]]);
         let (proof, _) = prove(&program, want, leanvm_core::pcs::TEST_LOG_INV_RATE).unwrap();
-        verify(&program, &want, &proof).expect("each branch initializes its default IV");
+        verify(&program, &want, &proof).expect("each branch initializes its padding run");
     }
 }
 
-/// Deferred aliases may expose non-adjacent source words for a syntactically
-/// consecutive CV StackBuf. The compiler must materialize that pair because
-/// the BLAKE2s opcode carries only one CV base offset.
 #[test]
-fn blake2s_materializes_aliased_cv_pair() {
-    let src = "\
-def main():
-    msg = [1, 2, 3, 4]
-    sources = [5, 99, 6]
-    cv = [sources[0], sources[2]]
-    out = StackBuf(2)
-    blake2s(msg[0:2], msg[2:4], out, cv=cv, counter=128)
-    p = 1
-    p[1] = out[0]
-    p[GEN] = out[1]
-    return
-";
-    let program = compile(&parse(src).expect("parse"));
-    let block = compression(
-        [F64(1), F64(0), F64(2), F64(0)],
-        [F64(3), F64(0), F64(4), F64(0)],
-        [F64(5), F64(0), F64(6), F64(0)],
-        metadata(128, 0, 0),
-    );
-    let d = digest(&block);
-    let want = [F192::new(d[0].0, d[1].0, 0), F192::new(d[2].0, d[3].0, 0)];
-    let (proof, _) = prove(&program, want, leanvm_core::pcs::TEST_LOG_INV_RATE).unwrap();
-    verify(&program, &want, &proof).expect("materialized custom CV verifies");
-}
-
-/// A custom CV with the default one-block metadata is not a chained block.
-/// A metadata cell inside the digest destination would be read before the digest
-/// is stored and re-read from the finished image by the witness, so the two would
-/// disagree and the proof would fail its opening with nothing to point at. Every
-/// other overlap is a write-once conflict, which does say where it happened.
-#[test]
-#[should_panic(expected = "md= must not name a cell of the digest destination")]
-fn blake2s_metadata_inside_the_destination_is_rejected() {
-    let src = "\
-def main():
-    msg = [1, 2, 3, 4]
-    out = StackBuf(2)
-    out[0] = 7
-    blake2s(msg[0:2], msg[2:4], out, md=out[0])
-    return
-";
+#[should_panic(expected = "keccak len= 129 is past the 128 bytes of its 8 cells")]
+fn keccak_len_past_the_cells_is_rejected() {
+    let src =
+        "def main():\n    out = StackBuf(2)\n    keccak([1, 2], [3, 4], out, tail=[5, 6, 7, 8], len=129)\n    return\n";
     let _ = compile(&parse(src).expect("parse"));
 }
 
-/// Require the caller to state the byte counter explicitly.
+/// A cell the message ends before would be hashed with it.
 #[test]
-#[should_panic(expected = "blake2s with cv= requires")]
-fn blake2s_cv_alone_is_rejected() {
-    let src = "\
-def main():
-    msg = [1, 2, 3, 4]
-    cv = [5, 6]
-    out = StackBuf(2)
-    blake2s(msg[0:2], msg[2:4], out, cv=cv)
-    return
-";
+#[should_panic(expected = "keccak len= 40 ends before message cell 3, which is not a literal 0")]
+fn keccak_cell_past_len_is_rejected() {
+    let src = "def main():\n    out = StackBuf(2)\n    keccak([1, 2], [3, 4], out, len=40)\n    return\n";
     let _ = compile(&parse(src).expect("parse"));
 }
 
-/// A general (non-blake2s) `StackBuf(3)`: indexed writes, an indexed read feeding
+#[test]
+#[should_panic(expected = "keccak_cells final=0 absorbs whole cells: it takes no len=")]
+fn keccak_cells_non_final_len_is_rejected() {
+    let src = "def main():\n    out = StackBuf(13)\n    keccak_cells([1, 2], out, final=0, len=16)\n    return\n";
+    let _ = compile(&parse(src).expect("parse"));
+}
+
+#[test]
+#[should_panic(expected = "keccak_cells state= must be the 13-cell run a previous keccak wrote")]
+fn keccak_short_state_is_rejected() {
+    let src =
+        "def main():\n    st = [1, 2]\n    out = StackBuf(2)\n    keccak_cells([1, 2], out, state=st)\n    return\n";
+    let _ = compile(&parse(src).expect("parse"));
+}
+
+/// A general (non-keccak) `StackBuf(3)`: indexed writes, an indexed read feeding
 /// an arithmetic write into another slot, then two slots published. Confirms the
 /// stack cells are plain consecutive frame cells addressable by index.
 #[test]
@@ -307,7 +317,7 @@ def main():
     // `+` is XOR: 3 ^ 4 = 7. Published: (sa[2], sa[1]) = (7, 4).
     let want = [F192::from(F64(7)), F192::from(F64(4))];
     let (proof, _) = prove(&program, want, leanvm_core::pcs::TEST_LOG_INV_RATE).unwrap();
-    assert_eq!(mix(src, want)[5], 0, "no BLAKE2s here");
+    assert_eq!(mix(src, want)[5], 0, "no KECCAK here");
     verify(&program, &want, &proof).expect("StackBuf indexing verifies");
 }
 
@@ -439,20 +449,19 @@ def step(state, v):
     tg[0] = v
     tg[1] = 3
     nb = StackBuf(2)
-    blake2s(state, tg, nb)
+    keccak(state, tg, nb)
     return nb, v
 ";
     let program = compile(&parse(src).expect("parse"));
 
-    // Each cell = one scalar in its low lane, so a StackBuf(2) hashes words
-    // [c0, 0, c1, 0]. x == v == 9 (the scalar return), so both steps use tag 9.
-    let tag = [F64(9), F64(0), F64(3), F64(0)];
-    let s1 = compress([F64(5), F64(0), F64(7), F64(0)], tag);
-    let s2 = compress(s1, tag); // the returned StackBuf (holding s1's words) fed back in
-    let want = [F192::new(s2[0].0, s2[1].0, 0), F192::new(s2[2].0, s2[3].0, 0)];
+    // x == v == 9 (the scalar return), so both steps use tag 9; the second hashes the
+    // returned StackBuf, holding the first digest.
+    let mut second = primitives::hash::hash(&scalar_cells([5, 7, 9, 3])).to_vec();
+    second.extend(scalar_cells([9, 3]));
+    let want = hash_cells(&second);
 
     let (proof, _) = prove(&program, want, leanvm_core::pcs::TEST_LOG_INV_RATE).unwrap();
-    assert_eq!(mix(src, want)[5], 2, "two BLAKE2s instructions (one per inlined step)");
+    assert_eq!(mix(src, want)[5], 2, "two KECCAK instructions (one per inlined step)");
     verify(&program, &want, &proof).expect("inline StackBuf+scalar tuple return verifies");
 }
 
@@ -527,7 +536,7 @@ def step(state, cursor):
     tg[0] = x
     tg[1] = 3
     nb = StackBuf(2)
-    blake2s(state, tg, nb)
+    keccak(state, tg, nb)
     return nb, x, cursor * GEN
 ";
     let program = compile(&parse(src).expect("parse"));
@@ -540,7 +549,7 @@ def step(state, cursor):
 
 /// `x = [a, b, c, d]`: the list-literal StackBuf initializer: allocates the run
 /// and writes the elements in place, sugar for alloc-then-store. The test mixes a
-/// runtime value, a constant, and an expression; feeds the result to blake2s; and
+/// runtime value, a constant, and an expression; feeds the result to keccak; and
 /// swaps a buffer through itself (`s = [s[1], s[0], …]` reads the OLD binding,
 /// per the let-rebind rule).
 #[test]
@@ -551,7 +560,7 @@ def main():
     s = [s[1], s[0]]
     t = [s[0] + s[1], 3]
     out = StackBuf(2)
-    blake2s(s, t, out)
+    keccak(s, t, out)
     p = 1
     p[1] = out[0]
     p[GEN] = out[1]
@@ -559,9 +568,9 @@ def main():
 ";
     let program = compile(&parse(src).expect("parse"));
     // s = [7, 5] after the swap → words [7,0,5,0]; t = [7 ^ 5, 3] = [2, 3] → [2,0,3,0].
-    let want = digest_cells([F64(7), F64(0), F64(5), F64(0)], [F64(2), F64(0), F64(3), F64(0)]);
+    let want = hash_cells(&scalar_cells([7, 5, 2, 3]));
     let (proof, _) = prove(&program, want, leanvm_core::pcs::TEST_LOG_INV_RATE).unwrap();
-    assert_eq!(mix(src, want)[5], 1, "one BLAKE2s instruction");
+    assert_eq!(mix(src, want)[5], 1, "one KECCAK instruction");
     verify(&program, &want, &proof).expect("list-literal StackBuf verifies");
 }
 
@@ -600,13 +609,13 @@ fn heap_hint_slice_oob_rejected() {
     let _ = compile(&parse(src).expect("parse"));
 }
 
-/// A blake2s heap slice straddling the buffer end is rejected. The 256-bit
+/// A keccak heap slice straddling the buffer end is rejected. The 256-bit
 /// operand `hb[7:9]` is two 128-bit cells, so the bound check trips at
 /// `7 + 2 = 9 > 8`.
 #[test]
 #[should_panic(expected = "heap slice 7:9 out of bounds for `hb` (HeapBuf size 8)")]
-fn heap_blake2s_slice_oob_rejected() {
-    let src = "def main():\n    hb = HeapBuf(8)\n    hb[GEN ** 7] = 5\n    out = StackBuf(2)\n    blake2s(hb[7:9], hb[7:9], out)\n    return\n";
+fn heap_keccak_slice_oob_rejected() {
+    let src = "def main():\n    hb = HeapBuf(8)\n    hb[GEN ** 7] = 5\n    out = StackBuf(2)\n    keccak(hb[7:9], hb[7:9], out)\n    return\n";
     let _ = compile(&parse(src).expect("parse"));
 }
 

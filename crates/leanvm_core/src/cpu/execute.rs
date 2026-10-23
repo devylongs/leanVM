@@ -137,8 +137,8 @@ pub enum Fault {
     NotInK { what: &'static str, value: F192 },
     /// A word that has to be an address or a count is not a g-power in its range.
     NotAGPower { what: &'static str, value: F64 },
-    /// A `BLAKE2s` operand outside the 128-bit embedding.
-    NotCanonical { operand: &'static str, value: F192 },
+    /// A `KECCAK` input cell outside the 128-bit embedding.
+    NotCanonical { cell: usize, value: F192 },
     /// A `MUL` asked to solve `a·x = c` for `x` with `a = 0`.
     BackSolveThroughZero,
     /// The advice does not fit the program: a witness stream is missing or
@@ -154,8 +154,8 @@ pub enum Fault {
 
 /// The longest run the interpreter executes.
 const MAX_STEPS: usize = 100_000_000;
-// A row touches at most nine cells, so every access count fits the `u32` exponent.
-const _: () = assert!(9 * MAX_STEPS < u32::MAX as usize);
+// A row touches at most a `KECCAK` row's cells, so every access count fits the `u32` exponent.
+const _: () = assert!(crate::keccak::ROW_CELLS * MAX_STEPS < u32::MAX as usize);
 
 impl ExecError {
     fn new(program: &Program, pc: u32, fault: Fault) -> Self {
@@ -202,10 +202,10 @@ impl std::fmt::Display for Fault {
             ),
             Self::NotInK { what, value } => write!(f, "{what} is not a K-valued word ({})", word(*value)),
             Self::NotAGPower { what, value } => write!(f, "{what} is not a g-power in range (0x{:016x})", value.0),
-            Self::NotCanonical { operand, value } => write!(
+            Self::NotCanonical { cell, value } => write!(
                 f,
-                "BLAKE2s {operand} cell is not a canonical 128-bit embedding: top limb 0x{:016x}",
-                value.c2
+                "KECCAK input cell {cell} is not a canonical 128-bit embedding ({})",
+                word(*value)
             ),
             Self::BackSolveThroughZero => write!(f, "cannot back-solve MUL through a zero operand"),
             Self::Witness(problem) => write!(f, "{problem}"),
@@ -267,6 +267,16 @@ impl Program {
     /// Compilation yields the `Program`; executing it (here) and proving it are
     /// separate later phases.
     pub fn execute(&self, public_input: [F192; 2]) -> Result<Execution, ExecError> {
+        self.execute_with(public_input, &mut |_| {})
+    }
+
+    /// [`Self::execute`], handing `keccak_step` the lanes each `KECCAK` row reads, in row order
+    /// and as the row runs.
+    pub(crate) fn execute_with(
+        &self,
+        public_input: [F192; 2],
+        keccak_step: &mut dyn FnMut(&[u64; primitives::hash::STATE_LANES]),
+    ) -> Result<Execution, ExecError> {
         use super::hints::{BitsDest, GPow, RHint};
 
         let ending_pc = (self.prog.len() - 1) as u32; // last bytecode slot, g^{B-1}
@@ -345,7 +355,7 @@ impl Program {
         let mut set: Rows<Srow> = Rows::new();
         let mut deref: Rows<Drow> = Rows::new();
         let mut jump: Rows<Jrow> = Rows::new();
-        let mut blake2s: Rows<Brow> = Rows::new();
+        let mut keccak: Rows<Krow> = Rows::new();
 
         // The memory's pages, grown as the run reaches them. Every method on the hot
         // path is `#[inline(always)]`: they sit in the interpreter's opcode loop.
@@ -903,52 +913,35 @@ impl Program {
                         pc += 1;
                     }
                 }
-                Op::Blake2s { ins, cv, out, md } => {
-                    // Four independently-addressed 128-bit message chunks, each a
-                    // single cell; the chaining value and the output each span two
-                    // consecutive cells; the metadata is one more cell.
-                    let (aa0, aa1, ab0, ab1) = (fp + ins[0], fp + ins[1], fp + ins[2], fp + ins[3]);
-                    let acv = fp + cv;
-                    let ac = fp + out;
-                    let amd = fp + md;
-                    let words = [aa0, aa1, ab0, ab1, acv, acv + 1, amd].map(|a| m.read(a));
-                    // Naming the operand and the line matters most for the metadata,
-                    // the one a guest builds with field arithmetic rather than reads.
-                    if let Some((i, &value)) = words.iter().enumerate().find(|(_, w)| w.c2 != 0) {
-                        const CELLS: [&str; 7] = ["m0", "m1", "m2", "m3", "cv0", "cv1", "md"];
-                        return Err(fail(Fault::NotCanonical {
-                            operand: CELLS[i],
-                            value,
-                        }));
+                Op::Keccak { .. } => {
+                    use crate::keccak::{ROW_CELLS, STATE_CELLS};
+                    let k = crate::tables::KeccakOp::of(&op);
+                    let cells: [u32; ROW_CELLS] = std::array::from_fn(|c| k.cell(fp, c));
+                    let input: [F192; STATE_CELLS] = std::array::from_fn(|c| m.read(cells[c]));
+                    // The table reads every cell with a literal zero top limb, so anything
+                    // else could not balance the bus.
+                    for (cell, &value) in input.iter().enumerate() {
+                        if value.c2 != 0 {
+                            return Err(fail(Fault::NotCanonical { cell, value }));
+                        }
                     }
-                    let va = [F64(words[0].c0), F64(words[0].c1), F64(words[1].c0), F64(words[1].c1)];
-                    let vb = [F64(words[2].c0), F64(words[2].c1), F64(words[3].c0), F64(words[3].c1)];
-                    let vcv = [F64(words[4].c0), F64(words[4].c1), F64(words[5].c0), F64(words[5].c1)];
-                    let metadata = words[6];
-                    // Compress the 64 message bytes to the 32-byte result, then
-                    // write it to c's two cells. No table constraint covers the
-                    // digest (the relation is proven by flock, §hash_flock); the
-                    // interpreter still computes the definite digest so the output
-                    // cells are consistent for any later read.
-                    let vc = blake2s_compress(va, vb, vcv, metadata);
-                    let outputs = [F192::new(vc[0].0, vc[1].0, 0), F192::new(vc[2].0, vc[3].0, 0)];
-                    m.put(ac, outputs[0])?;
-                    m.put(ac + 1, outputs[1])?;
-                    let ra = [m.bump_access_count(aa0), m.bump_access_count(aa1)];
-                    let rb = [m.bump_access_count(ab0), m.bump_access_count(ab1)];
-                    let rcv = [m.bump_access_count(acv), m.bump_access_count(acv + 1)];
-                    let rc = [m.bump_access_count(ac), m.bump_access_count(ac + 1)];
-                    // Last, matching the flush order, so an md cell aliasing another
-                    // operand still pairs each read with its own count.
-                    let rmd = m.bump_access_count(amd);
-                    blake2s.push(Brow {
+                    // No table constraint covers the output (the relation is proven
+                    // by the Keccak reduction, §keccak); the interpreter still computes it so
+                    // the output cells are consistent for any later read.
+                    let mut lanes = crate::keccak::state_of_cells(&input, k.in_odd);
+                    keccak_step(&lanes);
+                    primitives::hash::keccak_f(&mut lanes);
+                    let output = crate::keccak::cells_of_state(&lanes, k.out_odd);
+                    for (c, &v) in output.iter().enumerate() {
+                        m.put(cells[STATE_CELLS + c], v)?;
+                    }
+                    // In flush order, so a cell two operands alias still pairs each
+                    // read with its own count.
+                    let r: [u32; ROW_CELLS] = std::array::from_fn(|c| m.bump_access_count(cells[c]));
+                    keccak.push(Krow {
                         pc,
                         fp,
-                        ra,
-                        rb,
-                        rcv,
-                        rc,
-                        rmd,
+                        r,
                         bytecode_read,
                     });
                     pc += 1;
@@ -1006,7 +999,7 @@ impl Program {
             set,
             deref,
             jump,
-            blake2s,
+            keccak,
             bytecode_count,
             counts,
         };

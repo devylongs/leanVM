@@ -32,11 +32,11 @@ fn known_answer() {
     let signature = sign(&sk, &message, 0xA5C3_7E19).unwrap();
     assert_eq!(
         hex(&pk.as_ssz_bytes()),
-        "b60df5557dd72654da9b26eb5aee454fbb8b8839d80d6d0ab29a4226fc2c910f"
+        "4066673001949b6ff8b9299fd4ea17d28787ad501aafe4b64e2488107b5e3ec3"
     );
     assert_eq!(
         hex(&primitives::hash::hash(&signature.as_ssz_bytes())),
-        "76fe28fc5609099765d1289f0a75b397d8698e9abfe74d3f83bf01118e2db831"
+        "f10d62beec95e64e1477028252c2c8683695eab9d8787ad8fa722f47b5fd5234"
     );
 }
 
@@ -146,7 +146,7 @@ fn ssz_rejects_wrong_lengths() {
     LeanXmssSignature::from_ssz_bytes(&[0xcd; SIGNATURE_SSZ_LEN]).unwrap();
 }
 
-/// The address layout is leanSPHINCS's, and `Th` is BLAKE2s of `P | A | M`.
+/// The address layout is leanSPHINCS's, and `Th` is the leanVM hash of `P | A | M`.
 #[test]
 fn address_layout() {
     let tw = tweak(TWEAK_NODE, layer_hi(1, 0x12), 0x89abcdef).step(5);

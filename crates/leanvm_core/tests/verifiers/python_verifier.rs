@@ -4,13 +4,15 @@
 //! catches the Python one drifting.
 
 use lean_compiler::{compile, parse_with_replacements};
-use leanvm_core::cpu::{Program, Proof, Stats, prove, verify};
-use primitives::field::{F64, F192, g_pow};
+use leanvm_core::cpu::{Program, Stats, prove, public_input_bytes, verify};
+use leanvm_core::tables::N_TABLES;
+use primitives::field::{F192, g_pow};
 use std::collections::BTreeMap;
-use std::path::Path;
-use std::process::{Command, Output};
+use std::path::{Path, PathBuf};
+use std::process::{Child, Command, Stdio};
 use std::sync::OnceLock;
 use std::time::Instant;
+use verifier::{Bytecode, Proof, VerifierError, verify_execution};
 
 const SOURCE: &str = r#"
 from snark_lib import *
@@ -24,9 +26,9 @@ def mix(value, tag):
     return value * GEN + value
 
 def main():
-    seed = [5, 7]
+    # 160 bytes: two blocks, the second read in the odd layout.
     digest = StackBuf(2)
-    blake2s(seed, seed, digest)
+    keccak_cells([5, 7, 5, 7, 5, 7, 5, 7, 5, 7], digest)
 
     chain = HeapBuf(LOOP_STEPS + 1)
     chain[1] = digest[0]
@@ -56,33 +58,50 @@ pub(crate) fn encode(stream: &[F192], paths: &[verifier::MerklePath]) -> (Vec<u8
     (limbs.flat_map(u64::to_le_bytes).collect(), openings)
 }
 
-/// Write the raw proof as the two files Python reads and run the verifier on it.
-fn python_verify(directory: &Path, bytecode: &Path, public_input: &Path, stream: &[F192]) -> Output {
-    let (stream, openings) = encode(stream, &fixture().summary.merkle_paths);
-    let stream_path = directory.join("stream.bin");
-    let openings_path = directory.join("merkle_openings.bin");
-    std::fs::write(&stream_path, stream).expect("write scalar stream");
-    std::fs::write(&openings_path, openings).expect("write Merkle openings");
-    Command::new("python3")
-        .arg(Path::new(env!("CARGO_MANIFEST_DIR")).join("../../python-verifier/verifier.py"))
-        .arg(bytecode)
-        .arg(public_input)
-        .arg(stream_path)
-        .arg(openings_path)
-        .output()
+/// Write the statement and the raw proof with `stream` as the files Python reads, and start the verifier on them.
+fn spawn_python(directory: &Path, stream: &[F192]) -> Child {
+    let fixture = fixture();
+    std::fs::create_dir_all(directory).expect("create test directory");
+    let table = fixture
+        .bytecode_table()
+        .into_iter()
+        .flat_map(u64::to_le_bytes)
+        .collect();
+    let (stream, openings) = encode(stream, &fixture.summary.merkle_paths);
+    let files = [
+        ("bytecode.bin", table),
+        ("public_input.bin", public_input_bytes(&fixture.public_input).to_vec()),
+        ("stream.bin", stream),
+        ("merkle_openings.bin", openings),
+    ];
+    let mut command = Command::new("python3");
+    command.arg(Path::new(env!("CARGO_MANIFEST_DIR")).join("../../python-verifier/verifier.py"));
+    for (name, bytes) in files {
+        let path = directory.join(name);
+        std::fs::write(&path, bytes).expect("write verifier input");
+        command.arg(path);
+    }
+    command
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
         .expect("run native Python verifier")
 }
 
-fn public_input() -> [F192; 2] {
-    use leanvm_core::hash_flock::{FINAL_FLAG, IV, PINNED_T, compression, digest, metadata};
+fn test_directory(name: &str) -> PathBuf {
+    std::env::temp_dir().join(format!("leanvm-python-verifier-{name}-{}", std::process::id()))
+}
 
-    let seed = [F64(5), F64::ZERO, F64(7), F64::ZERO];
-    let metadata = metadata(PINNED_T, FINAL_FLAG, 0);
-    let digest = digest(&compression(seed, seed, IV, metadata));
-    let digest = [
-        F192::new(digest[0].0, digest[1].0, 0),
-        F192::new(digest[2].0, digest[3].0, 0),
-    ];
+fn public_input() -> [F192; 2] {
+    let message: Vec<u8> = [5u64, 7]
+        .repeat(5)
+        .into_iter()
+        .flat_map(|v| [v, 0])
+        .flat_map(u64::to_le_bytes)
+        .collect();
+    let digest = primitives::hash::hash(&message);
+    let word = |i: usize| u64::from_le_bytes(digest[8 * i..8 * i + 8].try_into().unwrap());
+    let digest = [F192::new(word(0), word(1), 0), F192::new(word(2), word(3), 0)];
     let mut value = digest[0];
     let mut index = F192::ONE;
     let generator = F192::from(g_pow(1));
@@ -103,7 +122,7 @@ fn public_input() -> [F192; 2] {
 pub(crate) struct Fixture {
     pub program: Program,
     pub public_input: [F192; 2],
-    pub proof: Proof,
+    pub proof: leanvm_core::cpu::Proof,
     pub stats: Stats,
     /// What verifying it leaves. Its paths, with the proof's stream, are the RAW
     /// proof: same protocol, each query carrying its own full Merkle path
@@ -143,29 +162,13 @@ pub(crate) fn fixture() -> &'static Fixture {
 #[test]
 fn test_python_verifier() {
     let Fixture {
-        program,
-        public_input,
-        proof,
-        stats,
-        ..
+        program, proof, stats, ..
     } = fixture();
-
-    let directory = std::env::temp_dir().join(format!("leanvm-python-verifier-test-{}", std::process::id()));
-    std::fs::create_dir_all(&directory).expect("create test directory");
-    let bytecode_path = directory.join("bytecode.bin");
-    let public_input_path = directory.join("public_input.bin");
-    let encoded = bincode::serialize(proof).expect("serialize proof");
-    let table: Vec<u8> = fixture()
-        .bytecode_table()
-        .into_iter()
-        .flat_map(u64::to_le_bytes)
-        .collect();
-    std::fs::write(&bytecode_path, &table).expect("write bytecode");
-    let public_input_bytes = leanvm_core::cpu::public_input_bytes(public_input);
-    std::fs::write(&public_input_path, public_input_bytes).expect("write public input");
-
+    let directory = test_directory("honest");
     let verification_started = Instant::now();
-    let output = python_verify(&directory, &bytecode_path, &public_input_path, &proof.stream);
+    let output = spawn_python(&directory, &proof.stream)
+        .wait_with_output()
+        .expect("wait for the Python verifier");
     let verification_time = verification_started.elapsed();
     assert!(
         output.status.success(),
@@ -178,8 +181,65 @@ fn test_python_verifier() {
         "zkDSL compiled to {} instructions; proved {} cycles in {} bytes; Python verified in {:.2?}",
         program.prog.len(),
         stats.cycles,
-        encoded.len(),
+        bincode::serialize(proof).expect("serialize proof").len(),
         verification_time,
     );
+    std::fs::remove_dir_all(directory).expect("remove test directory");
+}
+
+/// Both verifiers reject a tampered scalar at the same check: a high limb on an announced size and on the commitment
+/// root, and each check of the Keccak reduction tripped by the scalar it reads last.
+#[test]
+fn tampers_fail_the_same_check() {
+    let fixture = fixture();
+    // The reduction's stream: the committed outputs' claim, then each layer opening on its product polynomial and
+    // ending on three evaluations. The output opening follows (a slot sumcheck, then the word), then the input opening
+    // (a sumcheck over a pack's instances, one over the slot, then the slices). A degree-3 sumcheck sends two
+    // scalars a round.
+    const PRODUCT_COEFFICIENTS: usize = 47; // a product of two degree-23 embeddings
+    const PACK_BITS: usize = 4; // sixteen instances a pack
+    const SLOT_BITS: usize = 6; // 25 lanes of the 2 segments' states
+    const SLICES: usize = 64;
+    let keccak = fixture.summary.keccak_scalars.clone();
+    let input_opening = 2 * (PACK_BITS + SLOT_BITS) + SLICES;
+    let output_opening = 2 * SLOT_BITS + 1;
+    let cases = [
+        (0, VerifierError::AnnouncedHighLimb),
+        (N_TABLES + 2, VerifierError::DigestHalf),
+        (keccak.start + PRODUCT_COEFFICIENTS, VerifierError::KeccakProduct),
+        (
+            keccak.end - input_opening - output_opening - 1,
+            VerifierError::KeccakLayer,
+        ),
+        (keccak.end - input_opening - 1, VerifierError::KeccakOutputOpening),
+        (keccak.end - 1, VerifierError::KeccakInputOpening),
+    ];
+
+    let bytecode = Bytecode::new(&fixture.bytecode_table());
+    let public_input = public_input_bytes(&fixture.public_input);
+    let directory = test_directory("tampered");
+    let runs: Vec<Child> = cases
+        .iter()
+        .map(|&(position, error)| {
+            let mut stream = fixture.proof.stream.clone();
+            stream[position] += F192::new(0, 0, 1);
+            let (bytes, openings) = encode(&stream, &fixture.summary.merkle_paths);
+            let proof = Proof::load(&bytes, &openings).expect("load the tampered proof");
+            assert_eq!(
+                verify_execution(&bytecode, &public_input, &proof),
+                Err(error),
+                "scalar {position}"
+            );
+            spawn_python(&directory.join(position.to_string()), &stream)
+        })
+        .collect();
+    for ((position, error), run) in cases.into_iter().zip(runs) {
+        let output = run.wait_with_output().expect("wait for the Python verifier");
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert!(
+            !output.status.success() && stderr.contains(&format!("verification failed: {error}")),
+            "Python did not fail on `{error}` at scalar {position}:\n{stderr}"
+        );
+    }
     std::fs::remove_dir_all(directory).expect("remove test directory");
 }

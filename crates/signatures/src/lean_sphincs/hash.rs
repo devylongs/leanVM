@@ -17,8 +17,6 @@ pub const TWEAK_FOREST_SUBNODE: u8 = 17;
 /// The leaf of a tree: the top nodes of its two subtrees.
 pub const TWEAK_FOREST_TREE_LEAF: u8 = 18;
 pub const TWEAK_FOREST_NODE: u8 = 19;
-/// The few-time public key: the top nodes of the trees.
-pub const TWEAK_FOREST_KEY: u8 = 20;
 
 /// The seed the scheme derives from.
 pub fn scheme_seed(seed: &MasterSecret) -> MasterSecret {

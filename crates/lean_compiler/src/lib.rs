@@ -247,10 +247,24 @@ pub fn disassemble(prog: &[Op]) -> String {
             Op::Jump { oc, od, of } => {
                 format!("JUMP   if fp[{oc}]≠0: pc=fp[{od}], fp=fp[{of}]")
             }
-            Op::Blake2s { ins, cv, out, md } => {
+            Op::Keccak {
+                m,
+                tail,
+                b8,
+                cap,
+                out,
+                in_odd,
+                out_odd,
+            } => {
+                let layout = |odd: bool| if odd { "odd" } else { "even" };
                 format!(
-                    "BLAKE2S fp[{out}..]= compress(cv=fp[{cv}..], m=fp[{}],fp[{}],fp[{}],fp[{}], meta=fp[{md}])",
-                    ins[0], ins[1], ins[2], ins[3]
+                    "KECCAK fp[{out}..+13] {} = keccak_f(fp[{}],fp[{}],fp[{}],fp[{}], tail=fp[{tail}..+4], b8=fp[{b8}], cap=fp[{cap}..+4]) {}",
+                    layout(*out_odd),
+                    m[0],
+                    m[1],
+                    m[2],
+                    m[3],
+                    layout(*in_odd)
                 )
             }
         };
@@ -322,11 +336,22 @@ fn resolve(op: &LOp, entry: &HashMap<String, u32>, sentinel: u32, pc0: u32, fram
             od: *od,
             of: *of,
         },
-        LOp::Blake2s { ins, cv, c, md } => Op::Blake2s {
-            ins: *ins,
-            cv: *cv,
+        LOp::Keccak {
+            m,
+            tail,
+            b8,
+            cap,
+            c,
+            in_odd,
+            out_odd,
+        } => Op::Keccak {
+            m: *m,
+            tail: *tail,
+            b8: *b8,
+            cap: *cap,
             out: *c,
-            md: *md,
+            in_odd: *in_odd,
+            out_odd: *out_odd,
         },
     }
 }

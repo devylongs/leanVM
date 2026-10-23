@@ -57,7 +57,7 @@ pub enum Expr {
     HeapBufDyn(Box<Expr>),
     /// `StackBuf(n)`: allocate `n` *consecutive* frame (stack) cells, bound as a
     /// stack value. Its cells `sa[0..n]` are written/read directly (no heap deref),
-    /// and a size-2 `StackBuf` is a valid `blake2s` operand (the four 64-bit hash
+    /// and a size-2 `StackBuf` is a valid `keccak` operand (the four 64-bit hash
     /// words live as two lanes in each of two consecutive 128-bit cells).
     StackBuf(u64),
     /// `arr[idx]`: read a cell. For a heap `arr` (a pointer), `m[arr·idx]` (idx a
@@ -67,8 +67,8 @@ pub enum Expr {
     /// `buf[lo:hi]`: a run of cells of a [`Expr::StackBuf`] (frame cells
     /// `base+lo..base+hi`) or of a [`Expr::HeapBuf`] (heap cells
     /// `ptr·g^lo..ptr·g^hi`), with compile-time integer bounds (`hi`
-    /// exclusive). Only meaningful as a `blake2s` operand, where it must span
-    /// exactly 2 cells (one 256-bit value).
+    /// exclusive). Meaningful as a `keccak` operand, a hint destination, or a
+    /// function argument run.
     Slice(Box<Expr>, Box<Expr>, Box<Expr>),
     /// `[a, b, …]`: an initialized [`Expr::StackBuf`], so `x = [a, b]` allocates
     /// a StackBuf of the element count and writes each element in place, sugar
@@ -76,6 +76,10 @@ pub enum Expr {
     /// assignment (inside a function; a *top-level* `NAME = […]` is a constant
     /// array, see [`Ast::const_arrays`]).
     ListLit(Vec<Expr>),
+    /// `[body for var in unroll(lo, hi)]`: the list literal of `body` at each integer `var` of
+    /// `lo..hi`, expanded once the bounds are compile-time integers. Only a `keccak_cells`
+    /// argument.
+    ListComp(Box<Expr>, String, Box<Expr>, Box<Expr>),
 }
 
 /// A statement, with the source line it came from. The line is what every
@@ -319,6 +323,13 @@ fn free_vars_expr<'a>(e: &'a Expr, refs: &mut Vec<&'a str>) {
             free_vars_expr(hi, refs);
         }
         Expr::Call(_, args) | Expr::ListLit(args) => args.iter().for_each(|a| free_vars_expr(a, refs)),
+        Expr::ListComp(body, var, lo, hi) => {
+            let mut inner = Vec::new();
+            free_vars_expr(body, &mut inner);
+            refs.extend(inner.into_iter().filter(|v| v != var));
+            free_vars_expr(lo, refs);
+            free_vars_expr(hi, refs);
+        }
         Expr::HeapBufDyn(sz) | Expr::GenPow(sz) => free_vars_expr(sz, refs),
         Expr::Lit(_) | Expr::Gen | Expr::GPow(_) | Expr::HeapBuf(_) | Expr::StackBuf(_) => {}
     }

@@ -1,4 +1,4 @@
-//! Benchmark CLI for signature and blob proofs, recursion, and the Fibonacci demo.
+//! Benchmark CLI for signature and blob proofs, recursion, batched Keccak, and the Fibonacci demo.
 
 #[global_allocator]
 static ALLOCATOR: bench::Jemalloc = bench::Jemalloc;
@@ -79,6 +79,20 @@ enum Command {
         )]
         blobs_per_leaf: usize,
     },
+    /// Prove and verify a batch of Keccak-f permutations with the VM's GKR, outside the VM.
+    Hash {
+        /// Log2 of the number of permutations, from the reduction's fewest steps up to the
+        /// largest batch whose committed block the verifiers accept.
+        #[arg(
+            long,
+            default_value_t = 17,
+            value_parser = clap::builder::RangedU64ValueParser::<usize>::new().range(
+                u64::from(leanvm_core::keccak::MIN_STEPS.ilog2())
+                    ..=(leanvm_core::pcs::MAX_MU - leanvm_core::keccak::SLOT_LOG) as u64
+            )
+        )]
+        log_n: usize,
+    },
     /// Prove and verify Fibonacci in the exponent (demo).
     Fibonacci {
         /// Number of recurrence steps.
@@ -113,6 +127,9 @@ fn main() {
                 cli.tracing,
                 plan,
             );
+        }
+        Command::Hash { log_n } => {
+            keccak_gkr::batch_bench::run(1 << log_n, leanvm_core::keccak::DEPTH, cli.log_inv_rate, plan).print();
         }
         Command::Fibonacci { n } => {
             fibonacci::run_fibonacci(n, cli.log_inv_rate, plan);

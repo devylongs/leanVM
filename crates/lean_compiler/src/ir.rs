@@ -78,15 +78,17 @@ pub(crate) enum LOp {
         first: u32,
         dst: Off,
     },
-    /// `BLAKE2s`: the four 128-bit input chunks `ins` are addressed independently,
-    /// one frame cell each. The 32-byte output occupies the two consecutive
-    /// 128-bit cells `c, c+1`; `md` is the cell holding the byte counter and the
-    /// two flags.
-    Blake2s {
-        ins: [Off; 4],
-        cv: Off,
+    /// `KECCAK`: one permutation. The four `m` cells and `b8` are addressed
+    /// independently, `tail` (4 cells), `cap` (4 cells) and the output `c` (13 cells)
+    /// are consecutive runs; the flags name the layouts read and written.
+    Keccak {
+        m: [Off; 4],
+        tail: Off,
+        b8: Off,
+        cap: Off,
         c: Off,
-        md: Off,
+        in_odd: bool,
+        out_odd: bool,
     },
 }
 
@@ -138,19 +140,11 @@ pub(crate) struct JumpTables {
 
 /// A resolved run of consecutive cells ([`crate::lower::FnLower::cell_run`]): a
 /// frame (stack) run, used in place, or a heap slice (the buffer pointer's cell
-/// plus the first g-power offset), which a `blake2s` operand must bridge through
-/// the stack since `BLAKE2s` addresses only frame cells.
+/// plus the first g-power offset), which a `keccak` operand must bridge through
+/// the stack since `KECCAK` addresses only frame cells.
 pub(crate) enum CellRun {
     Stack { base: Off, len: u32 },
     Heap { ptr: Off, lo: u32, len: u32 },
-}
-
-impl CellRun {
-    pub(crate) fn cells(&self) -> u32 {
-        match *self {
-            CellRun::Stack { len, .. } | CellRun::Heap { len, .. } => len,
-        }
-    }
 }
 
 #[derive(Clone, Debug)]

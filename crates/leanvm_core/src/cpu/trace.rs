@@ -44,19 +44,14 @@ pub(crate) struct Jrow {
     pub(crate) bytecode_read: u32,
 }
 
-/// `BLAKE2s` row: the nine per-cell memory access counts of the four
-/// message-chunk cells, the chaining value's two cells, the output's two and the
-/// metadata cell. The addresses are `fp·g^{ins[i]}`, `fp·g^{cv}`, `fp·g^{out}`,
-/// `fp·g^{md}` and the successors of the middle two; the eighteen flock words are
-/// those cells' lanes.
-pub(crate) struct Brow {
+/// `KECCAK` row: the per-cell memory access counts, in the order the table flushes
+/// them (`tables::KeccakOp::cell`): the four `m` cells, the four `tail` cells, `b8`, the
+/// four `cap` cells, then the thirteen output cells. The fifty value lanes are those
+/// cells' lanes, read back from the final memory image.
+pub(crate) struct Krow {
     pub(crate) pc: u32,
     pub(crate) fp: u32,
-    pub(crate) ra: [u32; 2],  // per-cell counts for the two a input cells
-    pub(crate) rb: [u32; 2],  // … the two b input cells
-    pub(crate) rcv: [u32; 2], // … the two cv input cells
-    pub(crate) rc: [u32; 2],  // … the two c output cells
-    pub(crate) rmd: u32,      // … and the metadata cell
+    pub(crate) r: [u32; crate::keccak::ROW_CELLS],
     pub(crate) bytecode_read: u32,
 }
 
@@ -108,7 +103,7 @@ pub(crate) struct Trace {
     pub(crate) set: Rows<Srow>,
     pub(crate) deref: Rows<Drow>,
     pub(crate) jump: Rows<Jrow>,
-    pub(crate) blake2s: Rows<Brow>,
+    pub(crate) keccak: Rows<Krow>,
     pub(crate) bytecode_count: Vec<u32>, // per-pc execution count; the column holds g^{A[pc]}
     /// One past the highest access count, of a cell or a pc: the `g`-powers a fill looks up.
     pub(crate) counts: usize,
@@ -123,7 +118,7 @@ impl Trace {
             self.set.len(),
             self.deref.len(),
             self.jump.len(),
-            self.blake2s.len(),
+            self.keccak.len(),
         ]
     }
 }

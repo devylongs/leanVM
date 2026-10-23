@@ -154,10 +154,11 @@ struct Scope {
     /// outside it, where the other path leaves the cell unwritten and therefore
     /// prover-chosen, which is why this reverts at a join with the bindings.
     const_cells: HashMap<[u64; 3], Off>,
-    /// Two consecutive frame cells holding the standard BLAKE2s IV, emitted
-    /// lazily at the first dominating default-IV compression in this
-    /// control-flow scope.
-    blake2s_iv: Option<Off>,
+    /// Five consecutive frame cells holding `[pad, 0, 0, 0, 0]`, `pad` the padding's
+    /// first byte at the start of a cell: every constant `tail` and `cap` a fresh
+    /// `keccak` block needs is a window of it. Emitted lazily at the first dominating
+    /// fresh hash in this control-flow scope.
+    keccak_pad: Option<Off>,
 }
 
 impl Scope {
@@ -397,9 +398,9 @@ impl FnLower<'_> {
         o
     }
 
-    /// A frame cell holding `0`, set lazily once: the source for forwarded zero
-    /// words (a `BLAKE2s` padding half), and the destination every `assert a == b`
-    /// in this scope XORs into.
+    /// A frame cell holding `0`, set lazily once (or a zero of the `keccak` padding
+    /// run, when that came first): the condition of `assert_in_k`'s untaken jump, and
+    /// the destination every `assert a == b` in this scope XORs into.
     fn zero(&mut self) -> Off {
         self.const_cell(F192::ZERO)
     }
@@ -456,7 +457,7 @@ impl FnLower<'_> {
     }
 
     /// Run `f` with branch-local scope: bindings AND the lazily cached cells
-    /// (`one`, `self_fp`, range-check bounds, default BLAKE2s IV) revert
+    /// (`one`, `self_fp`, range-check bounds, the `keccak` padding run) revert
     /// afterwards, since a cell whose `SET` sits inside a conditionally-executed
     /// region must not be trusted outside it.
     fn scoped(&mut self, f: impl FnOnce(&mut Self)) {
@@ -853,7 +854,7 @@ impl FnLower<'_> {
             Expr::Pow(b, e) => self.pow_expr(b, e),
             Expr::Var(v) => match self.scope.bound(v).map(|b| b.val) {
                 Some(Binding::Stack(..)) => {
-                    self.fail(format!("StackBuf `{v}` used as a scalar; index it (`{v}[k]`) or pass it to blake2s"));
+                    self.fail(format!("StackBuf `{v}` used as a scalar; index it (`{v}[k]`) or pass it to keccak"));
                 }
                 Some(Binding::Gaddr(ga)) => self.materialize(ga),
                 Some(Binding::Scalar(o)) => o,
@@ -984,8 +985,9 @@ impl FnLower<'_> {
                     "`-`, `//`, `%` are compile-time only (field subtraction is `+`); use them in an index, a bound, or a `Const` argument, got `{e:?}`"
                 ))
             }
-            Expr::Slice(..) => self.fail("a slice is not a scalar; it is only a blake2s operand"),
+            Expr::Slice(..) => self.fail("a slice is not a scalar; it is only a keccak operand"),
             Expr::ListLit(..) => self.fail("a list literal must be bound to a name: `x = [a, b]`"),
+            Expr::ListComp(..) => self.fail("a list comprehension is only a keccak_cells argument"),
         }
     }
 

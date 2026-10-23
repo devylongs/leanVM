@@ -1,10 +1,11 @@
 //! What the two schemes share: the tweakable hash
-//! `Th(P, A, M) = Truncate_n(BLAKE2s(P | A | M))`, its address and the address
-//! types, so the recursion guest builds both schemes' addresses alike.
+//! `Th(P, A, M) = Truncate_n(H(P | A | M))`, `H` the leanVM hash
+//! ([`primitives::hash::hash`], Keccak-256), its address and
+//! the address types, so the recursion guest builds both schemes' addresses alike.
 //!
 //! The public parameter and the address are 16 bytes each, as every value hashed
-//! after them is: a chain step and a Merkle node are one compression, and a prover
-//! whose words are 16 bytes never has to cut a value in two.
+//! after them is, so a prover whose cells are 16 bytes never has to cut a value in
+//! two: a chain step and a Merkle node are one permutation.
 
 use primitives::hash::Hasher;
 
@@ -63,9 +64,10 @@ pub fn address(tw: &Tweak) -> [u8; ADDRESS_LEN] {
     out
 }
 
-/// Compressions BLAKE2s spends on a hash input whose payload is `payload` bytes.
+/// Permutations the leanVM hash spends on a hash input whose payload is
+/// `payload` bytes: one per 136-byte block, the last holding the padding.
 pub const fn blocks(payload: usize) -> usize {
-    (PUBLIC_PARAM_LEN + ADDRESS_LEN + payload).div_ceil(64)
+    (PUBLIC_PARAM_LEN + ADDRESS_LEN + payload) / primitives::hash::RATE + 1
 }
 
 /// A hasher that has absorbed `P | A`.
@@ -80,7 +82,7 @@ pub fn th(pp: &PublicParam, tw: &Tweak, payload: &[u8]) -> Digest {
     hasher(pp, tw).update(payload).finalize()[..N].try_into().unwrap()
 }
 
-/// `Th` over a concatenation of digests: a Merkle node, a leaf, a few-time key.
+/// `Th` over a concatenation of digests: a Merkle node or a leaf.
 pub fn th_digests(pp: &PublicParam, tw: &Tweak, values: &[Digest]) -> Digest {
     th(pp, tw, values.as_flattened())
 }

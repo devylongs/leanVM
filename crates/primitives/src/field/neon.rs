@@ -7,8 +7,8 @@
 //! and dependency-chain length in the hot loops. Builds without the extension
 //! transparently keep the two-`EOR` form.
 //!
-//! (`sha3` is the name of the ARMv8.2 feature *block* that carries `EOR3`,
-//! not a reference to the hash function. This crate hashes with BLAKE2s.)
+//! (`sha3` is the name of the ARMv8.2 feature *block* that carries `EOR3`; the
+//! batched Keccak-256 in `hash` uses the same block for its own instructions.)
 
 use core::arch::aarch64::*;
 
@@ -31,5 +31,6 @@ pub unsafe fn xor3_u64(a: uint64x2_t, b: uint64x2_t, c: uint64x2_t) -> uint64x2_
 #[cfg(not(target_feature = "sha3"))]
 #[inline(always)]
 pub unsafe fn xor3_u64(a: uint64x2_t, b: uint64x2_t, c: uint64x2_t) -> uint64x2_t {
-    veorq_u64(a, veorq_u64(b, c))
+    // SAFETY: NEON is baseline on aarch64.
+    unsafe { veorq_u64(a, veorq_u64(b, c)) }
 }

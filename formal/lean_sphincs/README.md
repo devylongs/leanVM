@@ -8,25 +8,25 @@ The game is [StatementDet.lean](Sphincs/StatementDet.lean). A uniform 32-byte se
 
 A key keeps one subtree of height `b` of the height-26 tree (`doc/lean_sphincs` explains the pruning). Each row is one theorem of [Lifetimes.lean](Sphincs/Lifetimes.lean):
 
-|    b |  signatures N | key generation, hash calls | key generation, compressions |
-| ---: | ------------: | -------------------------: | ---------------------------: |
-|   26 | 1,383,000,000 |             15,166,603,265 |               16,240,345,089 |
-|   20 |    26,030,000 |                236,978,189 |                  253,755,405 |
-|   14 |       480,900 |                  3,702,809 |                    3,964,953 |
-|   13 |       247,000 |                  1,851,419 |                    1,982,491 |
-|   12 |       126,900 |                    925,725 |                      991,261 |
-|   10 |        33,490 |                    231,457 |                      247,841 |
-|    8 |         8,830 |                     57,893 |                       61,989 |
+|  b |  signatures N | key generation, hash calls | key generation, permutations |
+| -: | ------------: | -------------------------: | ---------------------------: |
+| 26 | 1,383,000,000 |             15,166,603,265 |               15,636,365,313 |
+| 20 |    26,030,000 |                236,978,189 |                  244,318,221 |
+| 14 |       480,900 |                  3,702,809 |                    3,817,497 |
+| 13 |       247,000 |                  1,851,419 |                    1,908,763 |
+| 12 |       126,900 |                    925,725 |                      954,397 |
+| 10 |        33,490 |                    231,457 |                      238,625 |
+|  8 |         8,830 |                     57,893 |                       59,685 |
 
-The hash calls are `226 · 2^b + 2 (26 − b) + 1` (`Security.Prefix.hashCalls_keygenFromSeed`): the scheme seed, then per one-time key 32 derivations of chain starts, 192 chain steps and the leaf, then the `2^b − 1` nodes of the subtree, the `26 − b` surrogate siblings, the `26 − b` nodes above the subtree and the public parameter. In BLAKE2s compressions, a one-time leaf hashes 1,056 bytes and costs 17 and the scheme seed's 43 bytes cost 1, so the total is `242 · 2^b + 2 (26 − b) + 1`.
+The hash calls are `226 · 2^b + 2 (26 − b) + 1` (`Security.Prefix.hashCalls_keygenFromSeed`): the scheme seed, then per one-time key 32 derivations of chain starts, 192 chain steps and the leaf, then the `2^b − 1` nodes of the subtree, the `26 − b` surrogate siblings, the `26 − b` nodes above the subtree and the public parameter. In permutations of the leanVM hash, one per 136-byte block, the last holding the padding, a one-time leaf hashes 1,056 bytes and costs 8 and the scheme seed's 43 bytes cost 1, so the total is `233 · 2^b + 2 (26 − b) + 1`.
 
-Also proved: for every hash function and every subtree height, a signature the signer returns verifies (`Completeness.correct`), a signature serializes to 4,276 bytes (`signature_size`), and an accepted verification costs exactly 307 compressions and no signature costs more (`Cost.verification_compressions`, `Cost.verification_compressions_le`).
+Also proved: for every hash function and every subtree height, a signature the signer returns verifies (`Completeness.correct`), a signature serializes to 4,276 bytes (`signature_size`), and an accepted verification costs exactly 267 permutations of the leanVM hash, one per 136-byte block, the last holding the padding, and no signature more (`Cost.verification_permutations`, `Cost.verification_permutations_le`), which is `lean_sphincs::VERIFY_PERMUTATIONS`.
 
 ## The model and the Rust code
 
 [Scheme.lean](Sphincs/Scheme.lean) is the functional model. Its bytes are the crate's: the scheme seed `S = H(leanSPHINCS ‖ S0)` (`schemeSeedInput`, 43 bytes), the 16-byte address and every hash domain, the seed derivations (two chain starts per hash), the randomizer base `R0 = Th(P, A(7, 0, 0), S ‖ m)` and the attempts `R0 + i`, the 234-bit message digest and its field offsets, the codeword table (`codewordCodes`, the rule of `doc/lean_sphincs`), the kept subtree (the first 8 bytes of `P` mod `2^(26−b)`), the 2^32 bounds on randomizer and counter attempts, and the serialization. This was checked by reading both sides; it is not a mechanized refinement of the Rust.
 
-The two signers compute the same signature, but not with the same hash calls. The Lean signer recomputes the forest for its key and again for the opening, and hashes the digest once more after its loop, where the Rust signer reuses what it computed and keeps the BLAKE2s state after the digest's first block. The budget `q` of the theorem counts the calls of the Lean signer.
+The two signers compute the same signature, but not with the same hash calls. The Lean signer recomputes the forest for its key and again for the opening, and hashes the digest once more after its loop, where the Rust signer reuses what it computed. The budget `q` of the theorem counts the calls of the Lean signer.
 
 ## Build
 
@@ -46,4 +46,4 @@ lake build
 | [SphincsFors](SphincsFors) | The modules of the proof of the FORS variant of leanSPHINCS that `Sphincs` imports.                                                                                                                                                       |
 | [SphincsBase](SphincsBase) | The modules that `Sphincs` and `SphincsFors` import from the candidates' copy of the proof of leanVM's earlier leanSPHINCS instance (whose hash domains it renumbers): scheme-independent tooling (uniform tables, query caps, chain bounds). |
 
-The three come from [leanXMSS-leanSPHINCS-candidates](https://github.com/TomWambsgans/leanXMSS-leanSPHINCS-candidates/tree/cc0648feb5b686ba1447678120e401f7b78098f7/formal/lean_sphincs) at commit `cc0648f`, where they are named `LeanForest`, `LeanSphincs` and `SphincsSecurity` and where the rest of the FORS proof is. Only the modules `Sphincs` reaches are here, renamed and otherwise unchanged but for one comment of `LifetimeCertificates.lean` and of the script that writes it.
+The three come from [leanXMSS-leanSPHINCS-candidates](https://github.com/TomWambsgans/leanXMSS-leanSPHINCS-candidates/tree/134a0b638a3a5041f5abdebaed72569ed560619d/formal/sphincs) at commit `134a0b6`, where they are named `LeanForest`, `LeanSphincs` and `SphincsSecurity` and where the rest of the FORS proof is. Only the modules `Sphincs` reaches are here, renamed and otherwise unchanged but for the scheme seed `S = H(leanSPHINCS ‖ S0)` (`BridgeSchemeSeed.lean` and the key generation it reaches), for the doc comments of `VerificationCost.lean`, and for a doc comment of `Lifetimes.lean`, of `LifetimeCertificates.lean` and of the script that writes it.

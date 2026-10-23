@@ -2,7 +2,7 @@
 //!
 //! A port of `python-verifier/verifier.py`, kept close enough to read side by side: the same functions, in the same order, with the same constants.
 //!
-//! What the Python has no counterpart for sits in modules of its own: the prepared [`Bytecode`], the pruned Merkle openings a proof travels with (`merkle`), and what the statement of an aggregate adds, [`deferred`] and [`da`].
+//! What the Python has no counterpart for sits in modules of its own: the prepared [`Bytecode`], the pruned Merkle openings a proof travels with (`merkle`), and what the statement of an aggregate adds, [`da`].
 //!
 //! One walk of the protocol serves two entry points. [`verify_execution`] checks the proof. [`replay_unchecked`] reads the same [`Summary`] out of it and checks nothing: every check it leaves out is behind `Transcript::checked`.
 
@@ -11,32 +11,33 @@
 mod bus;
 mod bytecode;
 pub mod da;
-pub mod deferred;
 mod field;
-mod flock;
 mod hash;
+mod keccak;
 mod layout;
 mod merkle;
 mod multilinear;
+mod ring_switch;
 mod transcript;
 mod whir;
 
 pub use bytecode::Bytecode;
 pub use field::{E, K};
-pub use flock::FlockClaims;
 pub use layout::gpow;
 pub use merkle::{MerkleOpenings, MerklePath, PrunedMerklePaths};
 pub use transcript::Proof;
 
 use bus::{ColumnClaim, table_sumcheck, verify_bus_balance};
 use field::{ZERO, powers};
-use flock::{ring_switch, verify_flock};
-use hash::Digest;
+use hash::{Digest, ROUNDS, STATE_LANES};
+use keccak::{KeccakShape, verify_keccak};
 use layout::{
-    BLAKE2S_R1CS_LOG_SIZE, FLOCK_K_SKIP, MAX_STACKED_LOG, MEMORY_0, MEMORY_1, MEMORY_2, MIN_STACKED_LOG, N_TABLES,
-    OP_BLAKE2S, QFLOCK, build_layout,
+    GLOBAL_COLUMN_BASES, KECCAK_OUT, MAX_STACKED_LOG, MEMORY_0, MEMORY_1, MEMORY_2, MIN_STACKED_LOG, N_TABLES,
+    OP_KECCAK, QKECCAK, build_layout,
 };
-use multilinear::{dot, multilinear_eval};
+use multilinear::{dot, eq_eval, multilinear_eval};
+use ring_switch::ring_switch;
+use std::ops::Range;
 use transcript::Transcript;
 use whir::verify_whir;
 
@@ -65,7 +66,10 @@ pub enum VerifierError {
     InducedBasisDimensions,
     WhirTerminal,
     WhirNoTerminalLevel,
-    FlockLincheckTerminal,
+    KeccakProduct,
+    KeccakLayer,
+    KeccakOutputOpening,
+    KeccakInputOpening,
     AnnouncedHighLimb,
     PcsInverseRate,
     CommittedSize,
@@ -95,7 +99,10 @@ impl std::fmt::Display for VerifierError {
             Self::InducedBasisDimensions => "bad induced-basis dimensions",
             Self::WhirTerminal => "WHIR terminal check failed",
             Self::WhirNoTerminalLevel => "WHIR verification ended without a terminal level",
-            Self::FlockLincheckTerminal => "Flock lincheck terminal mismatch",
+            Self::KeccakProduct => "Keccak product polynomial does not carry the claim",
+            Self::KeccakLayer => "Keccak layer evaluations do not match the sumcheck",
+            Self::KeccakOutputOpening => "Keccak output opening ends on the wrong value",
+            Self::KeccakInputOpening => "Keccak input opening ends on the wrong value",
             Self::AnnouncedHighLimb => "announced size has a nonzero high limb",
             Self::PcsInverseRate => "invalid PCS inverse rate",
             Self::CommittedSize => "committed size outside the PCS window",
@@ -152,9 +159,8 @@ pub struct Summary {
     pub log_inv_rate: usize,
     /// Where the bus reads the stacked bytecode. Its value there is the claim an aggregate defers.
     pub bytecode_point: Vec<E>,
-    pub flock: FlockClaims,
-    /// The stream cursor just after flock's reduction, where the stacked opening's own scalars start.
-    pub flock_stream_end: usize,
+    /// The stream positions the Keccak reduction reads.
+    pub keccak_scalars: Range<usize>,
     /// One opening per query, in the order the walk read them.
     pub merkle_paths: Vec<MerklePath>,
 }
@@ -166,42 +172,58 @@ pub fn verify_execution(bytecode: &Bytecode, public_input: &[u8; 32], proof: &Pr
 
 /// NOT a verification: the [`Summary`] of `proof`, read out without checking it. An invalid proof is accepted.
 ///
-/// For a prover that reads its guest's witness out of a proof the guest then verifies in full. It walks the same transcript as [`verify_execution`] and leaves out every check: the sumcheck, GKR, constraint, flock lincheck and WHIR terminal identities, the bus count's nonzero check, the proof of work, the bytecode evaluation and the Merkle roots. It still fails on a proof it cannot walk: announced sizes out of range, a stream or openings of the wrong length or shape.
+/// For a prover that reads its guest's witness out of a proof the guest then verifies in full. It walks the same transcript as [`verify_execution`] and leaves out every check: the sumcheck, GKR, constraint, Keccak and WHIR terminal identities, the bus count's nonzero check, the proof of work, the bytecode evaluation and the Merkle roots. It still fails on a proof it cannot walk: announced sizes out of range, a stream or openings of the wrong length or shape.
 pub fn replay_unchecked(bytecode: &Bytecode, public_input: &[u8; 32], proof: &Proof) -> Result<Summary, VerifierError> {
     walk(bytecode, public_input, proof, false)
 }
 
-/// Exposed for flock's benchmark: a batch of BLAKE2s compressions proved alone, the packed witness the whole committed stack.
+/// Exposed for the Keccak reduction's benchmark and tests: a batch of `2^log_steps` permutations proved alone, a state
+/// committed every `depth` rounds, the committed states the whole stack.
 ///
-/// The proof is the commitment root, flock's reduction, then the ring switch and its opening, as in an execution proof.
-pub fn verify_flock_batch(
+/// The proof is the commitment root, the output lanes claimed at a challenge point, the reduction, then the ring
+/// switch and its opening, as in an execution proof. Its public input is the shape, the words `log_steps`, `depth`,
+/// `log_inv_rate` and zero, so a proof of one shape verifies for no other.
+pub fn verify_keccak_batch(
     fiat_shamir_iv: &[u8; 32],
-    public_input: &[u8; 32],
-    log_n: usize,
+    log_steps: usize,
+    depth: usize,
     log_inv_rate: usize,
     proof: &Proof,
-) -> Result<FlockClaims, VerifierError> {
-    let stack_log = log_n.checked_sub(FLOCK_K_SKIP).ok_or(VerifierError::CommittedSize)?;
+) -> Result<(), VerifierError> {
     require(
-        log_n >= BLAKE2S_R1CS_LOG_SIZE && (MIN_STACKED_LOG..=MAX_STACKED_LOG).contains(&stack_log),
+        log_steps >= layout::KECCAK_MIN_STEPS_LOG && depth > 0 && ROUNDS.is_multiple_of(depth),
         VerifierError::CommittedSize,
     )?;
-    let mut transcript = Transcript::new(proof, Digest(*fiat_shamir_iv), Digest(*public_input), true);
+    let shape = KeccakShape { log_steps, depth };
+    let stack_log = log_steps + shape.slot_bits();
+    require(
+        (MIN_STACKED_LOG..=MAX_STACKED_LOG).contains(&stack_log),
+        VerifierError::CommittedSize,
+    )?;
+    let mut statement = [0u8; 32];
+    for (bytes, word) in statement
+        .as_chunks_mut::<8>()
+        .0
+        .iter_mut()
+        .zip([log_steps, depth, log_inv_rate])
+    {
+        *bytes = (word as u64).to_le_bytes();
+    }
+    let mut transcript = Transcript::new(proof, Digest(*fiat_shamir_iv), Digest(statement), true);
     let halves = transcript.next_scalars(2)?;
     let root = Digest::from_halves(halves[0], halves[1])?;
-    let claims = verify_flock(log_n, &mut transcript)?;
-    let (target, weight) = ring_switch(claims.point(), &claims.s, &mut transcript);
-    let ringswitch: StackClaim = (Box::new(weight), target);
-    verify_stacked_opening(
-        &mut transcript,
-        root,
-        stack_log,
-        1 << stack_log,
-        log_inv_rate,
-        &[ringswitch],
-    )?;
+    let instance = transcript.samples(log_steps);
+    let output = transcript.next_scalars(STATE_LANES)?;
+    let openings = verify_keccak(&mut transcript, shape, &instance, &output)?;
+    let (point, slices) = openings.inputs;
+    let (target, weight) = ring_switch(point, &slices, &mut transcript);
+    let mut claims: Vec<StackClaim> = vec![(Box::new(weight), target)];
+    if let Some((point, word)) = openings.outputs {
+        claims.push((Box::new(move |x| eq_eval(&point, x)), word));
+    }
+    verify_stacked_opening(&mut transcript, root, stack_log, 1 << stack_log, log_inv_rate, &claims)?;
     transcript.finish()?;
-    Ok(claims)
+    Ok(())
 }
 
 fn walk(bytecode: &Bytecode, public_input: &[u8; 32], proof: &Proof, checked: bool) -> Result<Summary, VerifierError> {
@@ -238,7 +260,7 @@ fn walk(bytecode: &Bytecode, public_input: &[u8; 32], proof: &Proof, checked: bo
     let xi_powers = powers(xi, n_constraints + 3); // one power per constraint, then one per bus side, shared by every table
     let (constraint_powers, form_powers) = xi_powers.split_at(n_constraints);
     let target = dot(form_powers, &bus.totals);
-    let table_sumcheck_claims = table_sumcheck(
+    let evaluations = table_sumcheck(
         &layout.tables,
         &layout.table_log_heights,
         &bus.forms,
@@ -249,13 +271,19 @@ fn walk(bytecode: &Bytecode, public_input: &[u8; 32], proof: &Proof, checked: bo
         &mut transcript,
     )?;
     let mut claims = bus.claims;
-    claims.extend(table_sumcheck_claims);
+    for (base, (point, values)) in GLOBAL_COLUMN_BASES.into_iter().zip(&evaluations) {
+        claims.extend(values.iter().enumerate().map(|(local, &value)| ColumnClaim {
+            column: base + local,
+            point: point.clone(),
+            value,
+        }));
+    }
 
     // 5] binding the public input: each memory limb's claim is that limb's public line at the challenge, which the verifier
     // evaluates itself, so the prover sends nothing. Both public words are 128-bit, so the top limb's claim is zero.
     let public_challenge = transcript.sample();
     let (first, second) = public_input.halves();
-    let mut public_point = vec![ZERO; layout.placements[MEMORY_0].variables];
+    let mut public_point = vec![ZERO; layout.placements[MEMORY_0].expect("memory is committed").variables];
     public_point[0] = public_challenge;
     let public_pairs = [(first.c0, second.c0), (first.c1, second.c1), (first.c2, second.c2)];
     for (column, (low, high)) in [MEMORY_0, MEMORY_1, MEMORY_2].into_iter().zip(public_pairs) {
@@ -266,22 +294,37 @@ fn walk(bytecode: &Bytecode, public_input: &[u8; 32], proof: &Proof, checked: bo
         });
     }
 
-    // 6] BLAKE2s validity via Flock
-    let flock_log_n = BLAKE2S_R1CS_LOG_SIZE + layout.table_log_heights[OP_BLAKE2S];
-    let flock = verify_flock(flock_log_n, &mut transcript)?;
-    let flock_stream_end = transcript.stream_offset();
+    // 6] KECCAK validity, by GKR over the rounds. The table's claims on its output lanes are the reduction's claim on
+    // the permutation's output: they leave the batch, their columns having no placement.
+    let (point, values) = &evaluations[OP_KECCAK];
+    let keccak_start = transcript.stream_offset();
+    let openings = verify_keccak(
+        &mut transcript,
+        layout.keccak,
+        point,
+        &values[KECCAK_OUT..KECCAK_OUT + STATE_LANES],
+    )?;
+    let keccak_scalars = keccak_start..transcript.stream_offset();
+    if let Some((point, value)) = openings.outputs {
+        claims.push(ColumnClaim {
+            column: QKECCAK,
+            point,
+            value,
+        });
+    }
 
     // 7] Ring-switching
-    let (ringswitch_target, ringswitch_weight) = ring_switch(flock.point(), &flock.s, &mut transcript);
-    // That claim is supported on q_flock's region of the stack, so its weight carries the
+    let (point, slices) = openings.inputs;
+    let (ringswitch_target, ringswitch_weight) = ring_switch(point, &slices, &mut transcript);
+    // That claim is supported on q_keccak's region of the stack, so its weight carries the
     // placement's selector, and it leads the batch, taking the first power.
-    let qflock = layout.placements[QFLOCK];
+    let qkeccak = layout.placements[QKECCAK].expect("q_keccak is committed");
     let ringswitch: StackClaim = (
-        Box::new(|x| qflock.eq_above(x) * ringswitch_weight(&x[..qflock.variables])),
+        Box::new(move |x| qkeccak.eq_above(x) * ringswitch_weight(&x[..qkeccak.variables])),
         ringswitch_target,
     );
     let mut stack_claims = vec![ringswitch];
-    stack_claims.extend(claims.iter().map(|claim| claim.on_stack(&layout)));
+    stack_claims.extend(claims.iter().filter_map(|claim| claim.on_stack(&layout)));
     verify_stacked_opening(
         &mut transcript,
         root,
@@ -295,8 +338,7 @@ fn walk(bytecode: &Bytecode, public_input: &[u8; 32], proof: &Proof, checked: bo
         table_rows,
         log_inv_rate: log_inverse_rate as usize,
         bytecode_point: bus.bytecode_point,
-        flock,
-        flock_stream_end,
+        keccak_scalars,
         merkle_paths: transcript.finish()?,
     })
 }

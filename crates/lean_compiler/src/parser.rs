@@ -24,8 +24,7 @@ use expr::{
     binding_name, call_args, is_ident, parse_expr, split_assign, split_aug, split_once_top, split_top, string_lit,
     strip_comment, strip_const_wrapper, top_level_cmp,
 };
-pub(crate) use subst::subst_stmts;
-use subst::subst_var;
+pub(crate) use subst::{subst_stmts, subst_var};
 /// Parse zkDSL source (the Python-shaped surface syntax of `zkDSL.md`) into an
 /// [`Ast`]. The `snark_lib` import is skipped; any other import is an error,
 /// since a program is a single file.
@@ -237,7 +236,8 @@ pub fn parse_with_replacements(src: &str, replacements: &BTreeMap<String, String
 const BUILTINS: &[&str] = &[
     "addr",
     "assert_in_k",
-    "blake2s",
+    "keccak",
+    "keccak_cells",
     "const",
     "f192",
     "hint_decompose_bits",
